@@ -192,6 +192,8 @@ function isRequestSecure(req) {
     if (req.socket && req.socket.encrypted) return true;
     const xfProto = String(req.headers['x-forwarded-proto'] || '').toLowerCase();
     if (xfProto === 'https') return true;
+    const xScheme = String(req.headers['x-scheme'] || '').toLowerCase();
+    if (xScheme === 'https') return true;
   } catch {
     // ignore
   }
@@ -280,11 +282,36 @@ async function statDirBytes(dirPath) {
   }
 }
 
+async function statDirBytesRecursive(dirPath) {
+  try {
+    const entries = await fsp.readdir(dirPath, { withFileTypes: true });
+    let total = 0;
+    for (const e of entries) {
+      const abs = path.join(dirPath, e.name);
+      if (e.isDirectory()) {
+        total += await statDirBytesRecursive(abs);
+        continue;
+      }
+      if (!e.isFile()) continue;
+      try {
+        const s = await fsp.stat(abs);
+        total += s.size;
+      } catch {
+        // ignore
+      }
+    }
+    return total;
+  } catch (e) {
+    if (e.code === 'ENOENT') return 0;
+    throw e;
+  }
+}
+
 async function recomputeUsage(username) {
   const uploadsDir = path.join(USERS_ROOT, username, 'uploads');
   const generatedDir = path.join(USERS_ROOT, username, 'generated');
-  const uploadsBytes = await statDirBytes(uploadsDir);
-  const generatedBytes = await statDirBytes(generatedDir);
+  const uploadsBytes = await statDirBytesRecursive(uploadsDir);
+  const generatedBytes = await statDirBytesRecursive(generatedDir);
   const usage = { uploadsBytes, generatedBytes, updatedAt: nowIso() };
   await writeUsage(username, usage);
   return usage;
@@ -352,6 +379,12 @@ function parseDataUrl(dataUrl) {
   return { mime, buf };
 }
 
+function getThumbPathForImagePath(imagePath) {
+  const dir = path.dirname(imagePath);
+  const base = path.basename(imagePath, path.extname(imagePath));
+  return path.join(dir, 'thumbs', `${base}.webp`);
+}
+
 function mimeToExt(mime) {
   const m = String(mime || '').toLowerCase();
   if (m === 'image/jpeg') return 'jpg';
@@ -373,6 +406,13 @@ function guessContentTypeByExt(p) {
   if (ext === '.js') return 'text/javascript; charset=utf-8';
   if (ext === '.html') return 'text/html; charset=utf-8';
   return 'application/octet-stream';
+}
+
+function cacheControlForStatic(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  if (ext === '.html') return 'no-store';
+  if (ext === '.js' || ext === '.css') return 'public, max-age=0, must-revalidate';
+  return 'public, max-age=3600';
 }
 
 function isHttpUrl(u) {
@@ -423,13 +463,26 @@ function fetchUrlBuffer(urlStr, maxBytes = MAX_DOWNLOAD_BYTES, redirectsLeft = 3
   });
 }
 
-async function serveStaticFile(res, filePath) {
+async function serveStaticFile(req, res, filePath) {
   try {
     const stat = await fsp.stat(filePath);
     if (!stat.isFile()) return sendText(res, 404, 'Not found');
+
+    const etag = `W/\"${stat.size}-${Math.floor(stat.mtimeMs)}\"`;
+    const ifNoneMatch = req.headers['if-none-match'];
+    if (ifNoneMatch && String(ifNoneMatch) === etag) {
+      res.writeHead(304, {
+        ETag: etag,
+        'cache-control': cacheControlForStatic(filePath),
+      });
+      return res.end();
+    }
+
     res.writeHead(200, {
       'content-type': guessContentTypeByExt(filePath),
-      'cache-control': 'public, max-age=3600',
+      'cache-control': cacheControlForStatic(filePath),
+      ETag: etag,
+      'last-modified': new Date(stat.mtimeMs).toUTCString(),
     });
     fs.createReadStream(filePath).pipe(res);
   } catch (e) {
@@ -526,13 +579,13 @@ async function main() {
 
       // Static: app
       if (req.method === 'GET' && (pathname === '/' || pathname === '/banana.html')) {
-        return await serveStaticFile(res, path.join(ROOT, 'banana.html'));
+        return await serveStaticFile(req, res, path.join(ROOT, 'banana.html'));
       }
       if (req.method === 'GET' && pathname.startsWith('/assets/')) {
         const rel = pathname.replace(/^\/assets\//, '');
         const filePath = path.join(ROOT, 'assets', rel);
         if (!filePath.startsWith(path.join(ROOT, 'assets'))) return sendText(res, 400, 'Bad path');
-        return await serveStaticFile(res, filePath);
+        return await serveStaticFile(req, res, filePath);
       }
 
       // Protected file serving for images (cookie-based)
@@ -652,15 +705,25 @@ async function main() {
         if (!['uploads', 'generated'].includes(kind)) return sendJson(res, 400, { error: 'Invalid kind' });
         const parsed = parseDataUrl(body.dataUrl);
         if (!parsed) return sendJson(res, 400, { error: 'Invalid dataUrl' });
-        await assertGalleryHasSpace(auth.u, kind, parsed.buf.length);
+        const thumbParsed = body.thumbDataUrl ? parseDataUrl(body.thumbDataUrl) : null;
+        const thumbBytes = thumbParsed ? thumbParsed.buf.length : 0;
+        await assertGalleryHasSpace(auth.u, kind, parsed.buf.length + thumbBytes);
         const ext = mimeToExt(parsed.mime);
         const fileName = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}.${ext}`;
         const absPath = path.join(USERS_ROOT, auth.u, kind, fileName);
         await ensureDir(path.dirname(absPath));
         await fsp.writeFile(absPath, parsed.buf);
         await addUsage(auth.u, kind, parsed.buf.length);
+        let thumbUri = null;
+        if (thumbParsed) {
+          const thumbPath = getThumbPathForImagePath(absPath);
+          await ensureDir(path.dirname(thumbPath));
+          await fsp.writeFile(thumbPath, thumbParsed.buf);
+          await addUsage(auth.u, kind, thumbParsed.buf.length);
+          thumbUri = `/files/${encodeURIComponent(auth.u)}/${kind}/thumbs/${encodeURIComponent(path.basename(thumbPath))}`;
+        }
         const fileUri = `/files/${encodeURIComponent(auth.u)}/${kind}/${encodeURIComponent(fileName)}`;
-        return sendJson(res, 200, { fileUri, mime: parsed.mime });
+        return sendJson(res, 200, { fileUri, mime: parsed.mime, thumbUri });
       }
 
       if (pathname === '/api/images/save-batch' && req.method === 'POST') {
@@ -676,6 +739,8 @@ async function main() {
         for (const img of images) {
           const parsed = parseDataUrl(img?.dataUrl);
           if (parsed) totalBytes += parsed.buf.length;
+          const thumbParsed = img?.thumbDataUrl ? parseDataUrl(img.thumbDataUrl) : null;
+          if (thumbParsed) totalBytes += thumbParsed.buf.length;
         }
         await assertGalleryHasSpace(auth.u, kind, totalBytes);
 
@@ -685,6 +750,7 @@ async function main() {
             out.push(null);
             continue;
           }
+          const thumbParsed = img?.thumbDataUrl ? parseDataUrl(img.thumbDataUrl) : null;
           const ext = mimeToExt(parsed.mime);
           const fileName = `${Date.now()}_${crypto.randomBytes(6).toString('hex')}.${ext}`;
           const absPath = path.join(USERS_ROOT, auth.u, kind, fileName);
@@ -692,7 +758,15 @@ async function main() {
           await fsp.writeFile(absPath, parsed.buf);
           await addUsage(auth.u, kind, parsed.buf.length);
           const fileUri = `/files/${encodeURIComponent(auth.u)}/${kind}/${encodeURIComponent(fileName)}`;
-          out.push({ fileUri, mime: parsed.mime });
+          let thumbUri = null;
+          if (thumbParsed) {
+            const thumbPath = getThumbPathForImagePath(absPath);
+            await ensureDir(path.dirname(thumbPath));
+            await fsp.writeFile(thumbPath, thumbParsed.buf);
+            await addUsage(auth.u, kind, thumbParsed.buf.length);
+            thumbUri = `/files/${encodeURIComponent(auth.u)}/${kind}/thumbs/${encodeURIComponent(path.basename(thumbPath))}`;
+          }
+          out.push({ fileUri, mime: parsed.mime, thumbUri });
         }
         return sendJson(res, 200, { items: out });
       }
@@ -705,12 +779,28 @@ async function main() {
         const limit = parseInt(url.searchParams.get('limit') || '200', 10);
         const cursor = url.searchParams.get('cursor');
         const { items, nextCursor } = await listUserImages(auth.u, kind, limit, cursor);
-        const out = items.map((f) => ({
-          name: f.name,
-          size: f.size,
-          mtimeMs: f.mtimeMs,
-          fileUri: `/files/${encodeURIComponent(auth.u)}/${kind}/${encodeURIComponent(f.name)}`,
-        }));
+        const out = [];
+        for (const f of items) {
+          const fileUri = `/files/${encodeURIComponent(auth.u)}/${kind}/${encodeURIComponent(f.name)}`;
+          const abs = path.join(USERS_ROOT, auth.u, kind, f.name);
+          const thumbPath = getThumbPathForImagePath(abs);
+          let thumbUri = null;
+          try {
+            const st = await fsp.stat(thumbPath);
+            if (st.isFile()) {
+              thumbUri = `/files/${encodeURIComponent(auth.u)}/${kind}/thumbs/${encodeURIComponent(path.basename(thumbPath))}`;
+            }
+          } catch {
+            // ignore
+          }
+          out.push({
+            name: f.name,
+            size: f.size,
+            mtimeMs: f.mtimeMs,
+            fileUri,
+            thumbUri,
+          });
+        }
         return sendJson(res, 200, { items: out, nextCursor });
       }
 
@@ -735,6 +825,32 @@ async function main() {
           generatedBytes: usage.generatedBytes,
           updatedAt: usage.updatedAt,
         });
+      }
+
+      if (pathname === '/api/images/thumb' && req.method === 'POST') {
+        const auth = requireAuth(secret, req);
+        if (!auth) return sendJson(res, 401, { error: 'Unauthorized' });
+        const body = await readJsonBody(req);
+        const kind = String(body.kind || '').toLowerCase();
+        if (!['uploads', 'generated'].includes(kind)) return sendJson(res, 400, { error: 'Invalid kind' });
+        const originalFileUri = String(body.originalFileUri || '');
+        if (!originalFileUri.startsWith(`/files/${auth.u}/${kind}/`)) {
+          return sendJson(res, 400, { error: 'Invalid originalFileUri' });
+        }
+        const thumbParsed = parseDataUrl(body.thumbDataUrl);
+        if (!thumbParsed) return sendJson(res, 400, { error: 'Invalid thumbDataUrl' });
+        await assertGalleryHasSpace(auth.u, kind, thumbParsed.buf.length);
+
+        const rel = decodeURIComponent(originalFileUri.replace(`/files/${auth.u}/`, ''));
+        const abs = path.join(USERS_ROOT, auth.u, rel);
+        if (!abs.startsWith(path.join(USERS_ROOT, auth.u))) return sendJson(res, 400, { error: 'Bad path' });
+
+        const thumbPath = getThumbPathForImagePath(abs);
+        await ensureDir(path.dirname(thumbPath));
+        await fsp.writeFile(thumbPath, thumbParsed.buf);
+        await addUsage(auth.u, kind, thumbParsed.buf.length);
+        const thumbUri = `/files/${encodeURIComponent(auth.u)}/${kind}/thumbs/${encodeURIComponent(path.basename(thumbPath))}`;
+        return sendJson(res, 200, { ok: true, thumbUri });
       }
 
       if (pathname === '/api/images/fetch' && req.method === 'POST') {

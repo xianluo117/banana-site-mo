@@ -54,7 +54,7 @@
     <!-- JSZip for Batch Download -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 
-    <link rel="stylesheet" href="assets/styles.css" />
+    <link rel="stylesheet" href="assets/styles.css?v=3" />
 </head>
 <body class="h-screen flex overflow-hidden text-sm selection:bg-blue-500/30 touch-none" id="appBody">
     <!-- Drag Overlay (Global) -->
@@ -137,6 +137,25 @@
                 <div id="apiConfigList" class="space-y-2">
                     <!-- Saved configs will be rendered here -->
                 </div>
+            </section>
+
+            <!-- User Gallery -->
+            <section class="space-y-3">
+                <div class="flex items-center justify-between">
+                    <h3 class="text-xs font-bold text-gray-500 uppercase tracking-wider">用户图库</h3>
+                    <button id="sidebarOpenGalleryBtn" type="button" class="text-[10px] text-blue-400 hover:text-blue-300 border border-blue-900/50 bg-blue-900/10 px-2 py-1 rounded transition-colors flex items-center gap-1">
+                        <span class="material-symbols-rounded text-[14px]">photo_library</span> 打开
+                    </button>
+                </div>
+                <div class="grid grid-cols-2 gap-2">
+                    <button id="sidebarOpenUploadsBtn" type="button" class="py-2 bg-gray-800 border border-gray-700 rounded-lg text-gray-300 flex items-center justify-center gap-2 transition-colors active:scale-95">
+                        <span class="material-symbols-rounded">cloud_upload</span> 上传库
+                    </button>
+                    <button id="sidebarOpenGeneratedBtn" type="button" class="py-2 bg-gray-800 border border-gray-700 rounded-lg text-gray-300 flex items-center justify-center gap-2 transition-colors active:scale-95">
+                        <span class="material-symbols-rounded">auto_awesome</span> 生成库
+                    </button>
+                </div>
+                <div class="text-[10px] text-gray-500" id="sidebarCloudUsageLabel"></div>
             </section>
 
             <hr class="border-gray-800/50"/>
@@ -341,7 +360,7 @@
                     <span class="font-mono" id="authUserLabel">guest</span>
                     <span id="authAdminBadge" class="hidden text-[10px] font-bold px-1.5 py-0.5 rounded border border-yellow-600/40 bg-yellow-900/20 text-yellow-200">ADMIN</span>
                 </div>
-                <button id="cloudImagesBtn" class="hidden md:flex h-10 w-10 items-center justify-center rounded-lg bg-gray-800/50 hover:bg-gray-700 border border-gray-700 text-gray-300 hover:text-blue-300 transition-colors active:scale-95" onclick="toggleCloudImagesModal(true)" title="云图片库">
+                <button id="cloudImagesBtn" type="button" class="h-10 w-10 flex items-center justify-center rounded-lg bg-gray-800/50 hover:bg-gray-700 border border-gray-700 text-gray-300 hover:text-blue-300 transition-colors active:scale-95" title="云图片库">
                     <span class="material-symbols-rounded">photo_library</span>
                 </button>
                 <button id="loginBtn" class="h-10 px-3 rounded-lg bg-gray-800/50 hover:bg-gray-700 text-gray-200 border border-gray-700 hover:border-gray-600 transition-all text-xs font-medium active:scale-95" onclick="toggleAuthModal(true, 'login')">登录</button>
@@ -730,7 +749,7 @@
     </div>
 
     <!-- LIGHTBOX MODAL -->
-    <div class="fixed inset-0 z-50 hidden bg-black/95 backdrop-blur-md flex items-center justify-center opacity-0 transition-opacity duration-300" id="lightbox" onclick="closeLightbox()">
+    <div class="fixed inset-0 z-[70] hidden bg-black/95 backdrop-blur-md flex items-center justify-center opacity-0 transition-opacity duration-300" id="lightbox" onclick="closeLightbox()">
         <div class="absolute top-4 right-4 flex gap-2 z-10">
             <button class="text-white/70 hover:text-blue-400 p-2 bg-gray-800/80 rounded-full backdrop-blur transition-colors active:scale-95" onclick="event.stopPropagation(); downloadCurrentLightboxImage()">
                 <span class="material-symbols-rounded text-2xl">download</span>
@@ -816,19 +835,19 @@
                     <span class="material-symbols-rounded text-blue-400">photo_library</span>
                     <span class="font-mono text-xs font-bold text-gray-300">云图片库</span>
                 </div>
-                <button class="text-gray-500 hover:text-white transition-colors p-2 rounded hover:bg-gray-800" onclick="toggleCloudImagesModal(false)"><span class="material-symbols-rounded">close</span></button>
+                <button id="cloudImagesCloseBtn" type="button" class="text-gray-500 hover:text-white transition-colors p-2 rounded hover:bg-gray-800"><span class="material-symbols-rounded">close</span></button>
             </div>
             <div class="p-4 border-b border-gray-800 flex items-center gap-2">
-                <button id="cloudTabUploads" type="button" class="px-3 py-1.5 rounded-lg border bg-blue-600 border-blue-500 text-white text-xs font-medium transition-colors active:scale-95" onclick="switchCloudImagesTab('uploads')">上传图片库</button>
-                <button id="cloudTabGenerated" type="button" class="px-3 py-1.5 rounded-lg border bg-gray-900 border-gray-700 text-gray-300 hover:bg-gray-800 text-xs font-medium transition-colors active:scale-95" onclick="switchCloudImagesTab('generated')">生成图片库</button>
+                <button id="cloudTabUploads" type="button" class="px-3 py-1.5 rounded-lg border bg-blue-600 border-blue-500 text-white text-xs font-medium transition-colors active:scale-95">上传图片库</button>
+                <button id="cloudTabGenerated" type="button" class="px-3 py-1.5 rounded-lg border bg-gray-900 border-gray-700 text-gray-300 hover:bg-gray-800 text-xs font-medium transition-colors active:scale-95">生成图片库</button>
                 <div id="cloudUsageLabel" class="ml-2 text-[10px] text-gray-500 truncate"></div>
-                <button class="ml-auto px-3 py-1.5 rounded-lg border border-gray-700 bg-gray-900/50 text-gray-300 hover:bg-gray-800 text-xs font-medium transition-colors active:scale-95" onclick="refreshCloudImages()">刷新</button>
+                <button id="cloudImagesRefreshBtn" type="button" class="ml-auto px-3 py-1.5 rounded-lg border border-gray-700 bg-gray-900/50 text-gray-300 hover:bg-gray-800 text-xs font-medium transition-colors active:scale-95">刷新</button>
             </div>
             <div class="flex-1 overflow-auto p-4 custom-scrollbar">
                 <div id="cloudImagesGrid" class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3"></div>
                 <div id="cloudImagesEmpty" class="hidden text-xs text-gray-500 p-6 text-center">暂无图片</div>
                 <div class="pt-4 flex justify-center">
-                    <button id="cloudImagesLoadMore" class="hidden px-4 py-2 rounded-lg border border-gray-700 bg-gray-900/50 text-gray-300 hover:bg-gray-800 text-xs font-medium transition-colors active:scale-95" onclick="loadMoreCloudImages()">加载更多</button>
+                    <button id="cloudImagesLoadMore" type="button" class="hidden px-4 py-2 rounded-lg border border-gray-700 bg-gray-900/50 text-gray-300 hover:bg-gray-800 text-xs font-medium transition-colors active:scale-95">加载更多</button>
                 </div>
             </div>
         </div>
@@ -837,6 +856,6 @@
     <!-- Hidden File Input for Builder Rows -->
     <input type="file" id="builderRowInput" class="hidden" accept="image/*" multiple>
 
-    <script src="assets/app.js"></script>
+    <script src="assets/app.js?v=3"></script>
 </body>
 </html>
