@@ -1,0 +1,232 @@
+# Banana（Gemini 工作台 v4.9 修改版）
+
+这是一个单页 Web 应用（`banana.html` + `assets/`）+ 零依赖 Node.js 后端（`server/`），用于在 VPS 上实现：
+
+- 用户注册/登录（Cookie 会话）
+- Admin 管理员权限（首个注册用户默认为 Admin；也可用环境变量指定）
+- 图片按用户落盘：`uploads/`（用户上传）、`generated/`（模型生成/拉取）
+- 收藏（预设/对话/合集）独立存储且包含图片（服务端落盘，不随历史记录清理）
+- 历史记录限制：普通用户最多 50 条，Admin 不限
+
+## 目录结构
+
+- `banana.html`：前端入口
+- `assets/`：前端静态资源（`styles.css`、`app.js`）
+- `server/`：Node.js 后端
+- `data/`：运行时数据目录（默认会自动创建，已在 `.gitignore` 中忽略）
+  - `data/users/<username>/uploads/`
+  - `data/users/<username>/generated/`
+  - `data/users/<username>/favorites/`
+  - `data/users/<username>/history/`
+
+## 本地运行（开发/自测）
+
+要求：Node.js 18+（建议 20 LTS）
+
+1) 启动后端
+
+```bash
+cd server
+npm start
+```
+
+默认监听：`http://0.0.0.0:3000`
+
+2) 打开页面
+
+- 浏览器访问：`http://127.0.0.1:3000/`（由后端托管 `banana.html` 和 `assets/`）
+
+## 环境变量
+
+参考：`server/.env.example`
+
+- `PORT`：服务监听端口（默认 `3000`）
+- `NODE_ENV`：`production` 时会给 Cookie 加 `Secure`（HTTPS 部署建议设置）
+- `BANANA_SECRET`：签名密钥（不填会自动生成并写入 `data/secret.txt`）
+- `BANANA_ADMIN_USER` / `BANANA_ADMIN_PASS`：启动时确保该管理员账号存在（可选）
+
+## 云端部署教程（Ubuntu 22.04 / 24.04 VPS）
+
+下面以「域名 + Nginx + HTTPS + systemd」为推荐部署方式。
+
+### 1) 准备服务器与域名
+
+1. 购买 VPS（Ubuntu 22.04/24.04）
+2. 域名解析 A 记录指向 VPS 公网 IP
+3. 开放端口：`22`、`80`、`443`
+
+### 2) 安装 Node.js / Nginx
+
+```bash
+sudo apt update
+sudo apt install -y nginx
+```
+
+安装 Node.js（推荐 NodeSource 或系统包；任选其一）：
+
+**方式 A：NodeSource（推荐 20 LTS）**
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+```
+
+验证：
+
+```bash
+node -v
+npm -v
+```
+
+### 3) 上传代码到 VPS
+
+任选一种方式：
+
+- `git clone`（如果你的仓库可访问）
+- 或使用 `scp`/`rsync` 上传整个项目目录
+
+示例（上传到 `/opt/banana`）：
+
+```bash
+sudo mkdir -p /opt/banana
+sudo chown -R $USER:$USER /opt/banana
+```
+
+把本地项目内容放到 `/opt/banana`。
+
+### 4) 安装依赖并配置环境变量
+
+```bash
+cd /opt/banana/server
+npm install --omit=dev
+```
+
+创建环境变量文件（可选）：
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+至少建议设置：
+
+- `NODE_ENV=production`
+- `BANANA_ADMIN_USER=admin`、`BANANA_ADMIN_PASS=一个强密码`
+
+说明：首个注册用户默认会成为 Admin；如果你希望固定管理员账号，使用上述环境变量更可控。
+
+### 5) systemd 守护进程（推荐）
+
+创建服务文件：
+
+```bash
+sudo nano /etc/systemd/system/banana.service
+```
+
+填入（按需修改路径/端口/环境变量）：
+
+```ini
+[Unit]
+Description=Banana Web App
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/banana
+ExecStart=/usr/bin/node /opt/banana/server/index.js
+Restart=always
+RestartSec=2
+Environment=PORT=3000
+Environment=NODE_ENV=production
+Environment=BANANA_ADMIN_USER=admin
+Environment=BANANA_ADMIN_PASS=CHANGE_ME_STRONG_PASSWORD
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启动并设置开机自启：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now banana
+sudo systemctl status banana --no-pager
+```
+
+查看日志：
+
+```bash
+sudo journalctl -u banana -f
+```
+
+### 6) Nginx 反向代理（80/443 → Node）
+
+创建站点配置：
+
+```bash
+sudo nano /etc/nginx/sites-available/banana.conf
+```
+
+示例（先用 80，后续再上 HTTPS）：
+
+```nginx
+server {
+  listen 80;
+  server_name your-domain.com;
+
+  client_max_body_size 50m;
+
+  location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+}
+```
+
+启用并测试：
+
+```bash
+sudo ln -s /etc/nginx/sites-available/banana.conf /etc/nginx/sites-enabled/banana.conf
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+现在可访问：`http://your-domain.com`
+
+### 7) 配置 HTTPS（Let’s Encrypt）
+
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d your-domain.com
+```
+
+完成后，建议在 `banana.service` 里保持 `NODE_ENV=production`（使 Cookie 带 `Secure`）。
+
+### 8) 备份与容量建议
+
+- `data/` 是核心数据目录（用户、图片、收藏、历史），请定期备份
+- 普通用户历史记录会自动裁剪到 50 条；收藏不会自动删除
+- 若磁盘吃紧：
+  - 优先清理 `data/users/*/generated/` 中不需要的文件（收藏会有自己的快照目录）
+  - 或在业务层加“自动过期生成图”的策略（可后续继续优化）
+
+## 安全建议（强烈建议）
+
+- 必须使用 HTTPS 部署（否则 Cookie 在公网环境不安全）
+- 管理员密码务必设置强密码
+- 不要把 `data/` 暴露为静态目录；本项目通过 `/files/...` 且要求登录后访问
+
+## 常见问题
+
+### Q: 我用静态站点托管（S3/OSS）能用吗？
+
+不推荐。此项目的用户系统、图片落盘、收藏/历史限制都依赖 `server/` 后端。
+
+### Q: Admin 如何设置？
+
+- 默认：第一个注册用户自动成为 Admin
+- 推荐：在服务环境变量中设置 `BANANA_ADMIN_USER` / `BANANA_ADMIN_PASS`
+
