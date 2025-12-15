@@ -75,8 +75,21 @@ html:not(.dark) .stopped-status {
     color: #b45309 !important;
 }
 
-/* Fix image preview hover in light mode */
-html:not(.dark) #previewStrip .group:hover button { background-color: rgba(0,0,0,0.5) !important; color: #ffffff !important; }
+        /* Fix image preview hover in light mode */
+        html:not(.dark) #previewStrip .group:hover button { background-color: rgba(0,0,0,0.5) !important; color: #ffffff !important; }
+
+        /* Cloud gallery thumbnails (avoid cropping for mixed aspect ratios) */
+        .cloud-gallery-item {
+            aspect-ratio: 1 / 1;
+            background: rgba(17, 24, 39, 0.35);
+        }
+        .cloud-gallery-img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            display: block;
+            background: rgba(0,0,0,0.12);
+        }
 
 /* Custom Scrollbar */
 ::-webkit-scrollbar { width: 6px; height: 6px; }

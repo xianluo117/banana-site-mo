@@ -45,7 +45,9 @@ const runtime = {
     serverAvailable: true,
     me: null, // { username, isAdmin }
     authMode: 'login',
-    fileUriToInlineCache: new Map()
+    fileUriToInlineCache: new Map(),
+    postLoginAction: null, // { type: 'openCloudImages', tab: 'uploads'|'generated' }
+    imagePreloadCache: new Map()
 };
 
 function isAuthed() {
@@ -88,6 +90,46 @@ async function mapWithConcurrency(items, limit, mapper) {
     const workers = Array.from({ length: Math.min(cap, arr.length) }, () => worker());
     await Promise.all(workers);
     return results;
+}
+
+async function imageDataUrlToWebpThumb(dataUrl, maxSize = 256, quality = 0.7) {
+    const url = String(dataUrl || '');
+    if (!url.startsWith('data:image/')) return null;
+    return await new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+            try {
+                const w = img.naturalWidth || img.width || 1;
+                const h = img.naturalHeight || img.height || 1;
+                const scale = Math.min(1, maxSize / Math.max(w, h));
+                const tw = Math.max(1, Math.round(w * scale));
+                const th = Math.max(1, Math.round(h * scale));
+                const canvas = document.createElement('canvas');
+                canvas.width = tw;
+                canvas.height = th;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(img, 0, 0, tw, th);
+                const webp = canvas.toDataURL('image/webp', quality);
+                resolve(webp);
+            } catch {
+                resolve(null);
+            }
+        };
+        img.onerror = () => resolve(null);
+        img.src = url;
+    });
+}
+
+async function fileUriToDataUrl(fileUri) {
+    const res = await fetch(fileUri, { credentials: 'same-origin' });
+    if (!res.ok) throw new Error(`读取失败: HTTP ${res.status}`);
+    const blob = await res.blob();
+    return await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(new Error('读取失败'));
+        reader.readAsDataURL(blob);
+    });
 }
 
 async function apiFetchJson(apiPath, options = {}) {
@@ -343,12 +385,18 @@ const dom = {
     // Cloud images
     cloudImagesBtn: document.getElementById('cloudImagesBtn'),
     cloudImagesModal: document.getElementById('cloudImagesModal'),
+    cloudImagesCloseBtn: document.getElementById('cloudImagesCloseBtn'),
     cloudTabUploads: document.getElementById('cloudTabUploads'),
     cloudTabGenerated: document.getElementById('cloudTabGenerated'),
+    cloudImagesRefreshBtn: document.getElementById('cloudImagesRefreshBtn'),
     cloudImagesGrid: document.getElementById('cloudImagesGrid'),
     cloudImagesEmpty: document.getElementById('cloudImagesEmpty'),
     cloudImagesLoadMore: document.getElementById('cloudImagesLoadMore'),
-    cloudUsageLabel: document.getElementById('cloudUsageLabel')
+    cloudUsageLabel: document.getElementById('cloudUsageLabel'),
+    sidebarCloudUsageLabel: document.getElementById('sidebarCloudUsageLabel'),
+    sidebarOpenGalleryBtn: document.getElementById('sidebarOpenGalleryBtn'),
+    sidebarOpenUploadsBtn: document.getElementById('sidebarOpenUploadsBtn'),
+    sidebarOpenGeneratedBtn: document.getElementById('sidebarOpenGeneratedBtn')
 };
 
 function setAuthError(message) {
@@ -368,10 +416,16 @@ function updateAuthUI() {
     if (dom.logoutBtn) dom.logoutBtn.classList.toggle('hidden', !authed);
     if (dom.loginBtn) dom.loginBtn.classList.toggle('hidden', authed);
     if (dom.registerBtn) dom.registerBtn.classList.toggle('hidden', authed);
-    if (dom.cloudImagesBtn) dom.cloudImagesBtn.classList.toggle('hidden', !authed);
 
     if (dom.authUserLabel) dom.authUserLabel.textContent = authed ? runtime.me.username : 'guest';
     if (dom.authAdminBadge) dom.authAdminBadge.classList.toggle('hidden', !isAdmin());
+
+    if (authed) {
+        refreshCloudUsage().catch(() => {});
+    } else {
+        if (dom.cloudUsageLabel) dom.cloudUsageLabel.textContent = '';
+        if (dom.sidebarCloudUsageLabel) dom.sidebarCloudUsageLabel.textContent = '';
+    }
 }
 
 function switchAuthMode(mode) {
@@ -403,6 +457,13 @@ function toggleAuthModal(show, mode) {
     }
 }
 
+function requireLoginFor(action) {
+    if (isAuthed()) return true;
+    runtime.postLoginAction = action || null;
+    toggleAuthModal(true, 'login');
+    return false;
+}
+
 async function refreshMe() {
     try {
         const data = await apiFetchJson('/api/me');
@@ -432,8 +493,11 @@ const cloudImagesState = {
     tab: 'uploads',
     cursor: null,
     loading: false,
-    usageLoading: false
+    usageLoading: false,
+    items: []
 };
+
+const LIGHTBOX_PRELOAD_NEIGHBORS = 1; // prev + next => 2 images
 
 function formatBytes(bytes) {
     const b = Number(bytes || 0);
@@ -444,22 +508,47 @@ function formatBytes(bytes) {
 }
 
 async function refreshCloudUsage() {
-    if (!isAuthed() || !dom.cloudUsageLabel || cloudImagesState.usageLoading) return;
+    if (!isAuthed() || cloudImagesState.usageLoading) return;
+    if (!dom.cloudUsageLabel && !dom.sidebarCloudUsageLabel) return;
     cloudImagesState.usageLoading = true;
     try {
         const res = await apiFetchJson('/api/storage/usage');
         const used = Number(res.usedBytes || 0);
         const quota = res.quotaBytes;
-        if (quota == null) {
-            dom.cloudUsageLabel.textContent = `已用 ${formatBytes(used)} / 不限（ADMIN）`;
-        } else {
-            dom.cloudUsageLabel.textContent = `已用 ${formatBytes(used)} / ${formatBytes(quota)}（上传+生成）`;
-        }
+        const label = quota == null
+            ? `已用 ${formatBytes(used)} / 不限（ADMIN）`
+            : `已用 ${formatBytes(used)} / ${formatBytes(quota)}（上传+生成）`;
+        if (dom.cloudUsageLabel) dom.cloudUsageLabel.textContent = label;
+        if (dom.sidebarCloudUsageLabel) dom.sidebarCloudUsageLabel.textContent = label;
     } catch (e) {
-        dom.cloudUsageLabel.textContent = '';
+        if (dom.cloudUsageLabel) dom.cloudUsageLabel.textContent = '';
+        if (dom.sidebarCloudUsageLabel) dom.sidebarCloudUsageLabel.textContent = '';
     } finally {
         cloudImagesState.usageLoading = false;
     }
+}
+
+function openCloudImages(kind) {
+    const tab = kind === 'generated' ? 'generated' : 'uploads';
+    if (!isAuthed()) {
+        requireLoginFor({ type: 'openCloudImages', tab });
+        return;
+    }
+    toggleCloudImagesModal(true);
+    switchCloudImagesTab(tab);
+}
+
+function setupCloudImagesUI() {
+    dom.cloudImagesBtn?.addEventListener('click', () => toggleCloudImagesModal(true));
+    dom.sidebarOpenGalleryBtn?.addEventListener('click', () => toggleCloudImagesModal(true));
+    dom.sidebarOpenUploadsBtn?.addEventListener('click', () => openCloudImages('uploads'));
+    dom.sidebarOpenGeneratedBtn?.addEventListener('click', () => openCloudImages('generated'));
+
+    dom.cloudImagesCloseBtn?.addEventListener('click', () => toggleCloudImagesModal(false));
+    dom.cloudTabUploads?.addEventListener('click', () => switchCloudImagesTab('uploads'));
+    dom.cloudTabGenerated?.addEventListener('click', () => switchCloudImagesTab('generated'));
+    dom.cloudImagesRefreshBtn?.addEventListener('click', () => refreshCloudImages());
+    dom.cloudImagesLoadMore?.addEventListener('click', () => loadMoreCloudImages());
 }
 
 function switchCloudImagesTab(tab) {
@@ -478,6 +567,10 @@ function switchCloudImagesTab(tab) {
 
 function toggleCloudImagesModal(show) {
     if (!dom.cloudImagesModal) return;
+    if (show && !isAuthed()) {
+        requireLoginFor({ type: 'openCloudImages', tab: cloudImagesState.tab });
+        return;
+    }
     dom.cloudImagesModal.classList.toggle('hidden', !show);
     if (show) {
         refreshCloudUsage().catch(() => {});
@@ -488,18 +581,25 @@ function toggleCloudImagesModal(show) {
 function renderCloudImages(items, append = false) {
     if (!dom.cloudImagesGrid) return;
     if (!append) dom.cloudImagesGrid.innerHTML = '';
-    (items || []).forEach((it) => {
+    if (!append) cloudImagesState.items = [];
+    const startIndex = cloudImagesState.items.length;
+    (items || []).forEach((it, localIdx) => {
+        cloudImagesState.items.push(it);
         const wrap = document.createElement('div');
-        wrap.className = 'group relative rounded-lg border border-gray-800 bg-gray-900/30 overflow-hidden';
+        wrap.className = 'cloud-gallery-item group relative rounded-lg border border-gray-800 overflow-hidden';
+        const thumb = it.thumbUri || it.thumb_uri || null;
+        const full = it.fileUri || it.file_uri;
+        const src = thumb || full;
         wrap.innerHTML = `
-            <img src="${it.fileUri}" class="w-full h-28 object-cover block" loading="lazy" />
+            <img src="${src}" class="cloud-gallery-img" loading="lazy" decoding="async" />
             <div class="absolute inset-x-0 bottom-0 p-1 bg-black/50 text-[10px] text-gray-200 opacity-0 group-hover:opacity-100 transition-opacity truncate">
                 ${(it.name || '').toString()}
             </div>
         `;
         wrap.addEventListener('click', (e) => {
             e.preventDefault();
-            openLightbox(it.fileUri);
+            state.lightboxContext = { type: 'cloud', items: cloudImagesState.items, index: startIndex + localIdx };
+            openLightbox(full, thumb);
         });
         dom.cloudImagesGrid.appendChild(wrap);
     });
@@ -509,10 +609,7 @@ function renderCloudImages(items, append = false) {
 }
 
 async function fetchCloudImagesPage(reset = false) {
-    if (!isAuthed()) {
-        alert('请先登录');
-        return;
-    }
+    if (!isAuthed()) return;
     if (cloudImagesState.loading) return;
     cloudImagesState.loading = true;
     try {
@@ -536,6 +633,7 @@ async function fetchCloudImagesPage(reset = false) {
 }
 
 async function refreshCloudImages() {
+    if (!isAuthed()) return;
     cloudImagesState.cursor = null;
     if (dom.cloudImagesEmpty) dom.cloudImagesEmpty.classList.add('hidden');
     if (dom.cloudImagesLoadMore) dom.cloudImagesLoadMore.classList.add('hidden');
@@ -544,6 +642,20 @@ async function refreshCloudImages() {
 
 async function loadMoreCloudImages() {
     await fetchCloudImagesPage(false);
+}
+
+// Ensure cloud-gallery helpers are callable from inline HTML onclick handlers.
+// (Top-level const/let bindings don't always become window properties.)
+try {
+    if (typeof window !== 'undefined') {
+        window.openCloudImages = openCloudImages;
+        window.toggleCloudImagesModal = toggleCloudImagesModal;
+        window.switchCloudImagesTab = switchCloudImagesTab;
+        window.refreshCloudImages = refreshCloudImages;
+        window.loadMoreCloudImages = loadMoreCloudImages;
+    }
+} catch {
+    // ignore
 }
 
 async function submitAuth() {
@@ -560,6 +672,11 @@ async function submitAuth() {
         await refreshMe();
         if (isAuthed()) {
             await loadFavoritesFromServer();
+            const action = runtime.postLoginAction;
+            runtime.postLoginAction = null;
+            if (action?.type === 'openCloudImages') {
+                openCloudImages(action.tab);
+            }
         }
         toggleAuthModal(false);
         alert(isAdmin() ? '已登录（ADMIN）' : '已登录');
@@ -1061,6 +1178,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     state.apiFormat = localStorage.getItem('gem_api_format') || 'gemini';
     state.collections = JSON.parse(localStorage.getItem('gem_collections_v1.0') || '[]'); // 从 localStorage 加载合集
 
+    setupCloudImagesUI();
+
     await refreshMe();
     if (isAuthed()) {
         try {
@@ -1337,10 +1456,42 @@ async function saveImagesToServerBatch(kind, dataUrls, chunkSize = 5) {
     return results;
 }
 
+async function saveImagesToServerBatchWithThumbs(kind, items, chunkSize = 5) {
+    if (!isAuthed()) return new Array((items || []).length).fill(null);
+    const list = Array.isArray(items) ? items : [];
+    const size = Math.max(1, Math.min(20, Number(chunkSize) || 5));
+    const results = [];
+
+    for (let i = 0; i < list.length; i += size) {
+        const chunk = list.slice(i, i + size);
+        try {
+            const res = await apiFetchJson('/api/images/save-batch', {
+                method: 'POST',
+                json: {
+                    kind,
+                    images: chunk.map(x => ({ dataUrl: x.dataUrl, thumbDataUrl: x.thumbDataUrl || null }))
+                }
+            });
+            const out = Array.isArray(res.items) ? res.items : [];
+            results.push(...out);
+        } catch (e) {
+            console.warn('批量保存图片(含缩略图)失败:', e);
+            if (e?.status === 507) alert(e.message || '图库容量不足');
+            results.push(...new Array(chunk.length).fill(null));
+        }
+    }
+    return results;
+}
+
 async function handleFileUpload(files, target, rowIdx = null) {
     const list = Array.from(files || []).filter(f => f && f.type && f.type.startsWith('image/'));
     const dataUrls = await mapWithConcurrency(list, 4, async (file) => await readFileAsDataURL(file));
-    const storedItems = await saveImagesToServerBatch('uploads', dataUrls, 5);
+    const thumbUrls = await mapWithConcurrency(dataUrls, 4, async (d) => await imageDataUrlToWebpThumb(d, 256, 0.7));
+    const storedItems = await saveImagesToServerBatchWithThumbs(
+        'uploads',
+        dataUrls.map((d, i) => ({ dataUrl: d, thumbDataUrl: thumbUrls[i] })),
+        5
+    );
 
     for (let i = 0; i < dataUrls.length; i++) {
         const dataUrl = dataUrls[i];
@@ -1349,6 +1500,7 @@ async function handleFileUpload(files, target, rowIdx = null) {
         const imgObj = { mime, data: b64, b64: dataUrl };
         const stored = storedItems[i];
         if (stored?.fileUri) imgObj.file_uri = stored.fileUri;
+        if (stored?.thumbUri) imgObj.thumb_uri = stored.thumbUri;
 
         if (target === 'global') {
             state.images.push(imgObj);
@@ -2416,8 +2568,12 @@ async function persistGeneratedImagesInSession(sessionId) {
 
     try {
         if (inlineJobs.length) {
-            const res = await apiFetchJson('/api/images/save-batch', { method: 'POST', json: { kind: 'generated', images: inlineJobs } });
-            const items = Array.isArray(res.items) ? res.items : [];
+            const thumbUrls = await mapWithConcurrency(inlineJobs, 4, async (job) => await imageDataUrlToWebpThumb(job.dataUrl, 256, 0.7));
+            const items = await saveImagesToServerBatchWithThumbs(
+                'generated',
+                inlineJobs.map((job, i) => ({ dataUrl: job.dataUrl, thumbDataUrl: thumbUrls[i] })),
+                5
+            );
             for (let i = 0; i < items.length; i++) {
                 const stored = items[i];
                 const part = partRefs[i];
@@ -2440,6 +2596,19 @@ async function persistGeneratedImagesInSession(sessionId) {
                     if (stored?.fileUri && part) {
                         part.file_data = { mime_type: stored.mime || 'image/png', file_uri: stored.fileUri };
                         delete part.fileData;
+                        // Backfill thumbnail for this remote-saved image
+                        try {
+                            const dataUrl = await fileUriToDataUrl(stored.fileUri);
+                            const thumb = await imageDataUrlToWebpThumb(dataUrl, 256, 0.7);
+                            if (thumb) {
+                                await apiFetchJson('/api/images/thumb', {
+                                    method: 'POST',
+                                    json: { kind: 'generated', originalFileUri: stored.fileUri, thumbDataUrl: thumb }
+                                });
+                            }
+                        } catch (e2) {
+                            console.warn('生成图缩略图补传失败（可忽略）:', e2);
+                        }
                     }
                 } catch (e) {
                     console.warn('拉取远程生成图失败（可忽略）:', url, e);
@@ -3294,15 +3463,76 @@ function viewRaw(id) {
     toggleRawModal(true);
 }
 function toggleRawModal(show) { dom.rawModal.classList.toggle('hidden', !show); }
-function openLightbox(src) {
-    state.currentLightboxSrc = src;
-    dom.lightboxImg.src = src;
+
+function preloadImage(url) {
+    if (!url || typeof url !== 'string') return Promise.resolve();
+    if (runtime.imagePreloadCache.has(url)) return runtime.imagePreloadCache.get(url);
+    const task = new Promise((resolve) => {
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = () => resolve();
+        img.onerror = () => resolve();
+        img.src = url;
+    });
+    runtime.imagePreloadCache.set(url, task);
+    return task;
+}
+
+function preloadAdjacentImages(items, index, neighbors = 1) {
+    const n = Math.max(0, Math.min(3, Number(neighbors) || 0));
+    if (!n) return;
+    const list = Array.isArray(items) ? items : [];
+    const len = list.length;
+    if (!len) return;
+
+    const targets = [];
+    for (let i = 1; i <= n; i++) {
+        const prev = (index - i + len) % len;
+        const next = (index + i) % len;
+        if (prev !== index) targets.push(list[prev]);
+        if (next !== index) targets.push(list[next]);
+    }
+
+    targets.forEach((t) => {
+        const full = typeof t === 'string' ? t : (t.fileUri || t.file_uri);
+        if (full) preloadImage(full);
+    });
+}
+
+function openLightbox(src, previewSrc = null) {
+    const fullSrc = src;
+    state.currentLightboxSrc = fullSrc;
+
+    const preview = previewSrc && typeof previewSrc === 'string' ? previewSrc : null;
+    const usePreview = preview && preview !== fullSrc;
+
+    dom.lightboxImg.dataset.fullSrc = fullSrc;
+    dom.lightboxImg.src = usePreview ? preview : fullSrc;
+
+    if (usePreview) {
+        const preloader = new Image();
+        preloader.onload = () => {
+            if (dom.lightboxImg.dataset.fullSrc === fullSrc) {
+                dom.lightboxImg.src = fullSrc;
+            }
+        };
+        preloader.src = fullSrc;
+    }
     dom.lightbox.classList.remove('hidden');
     setTimeout(() => {
         dom.lightbox.classList.remove('opacity-0');
         dom.lightboxImg.classList.remove('scale-95');
         dom.lightboxImg.classList.add('scale-100');
     }, 10);
+
+    try {
+        const ctx = state.lightboxContext;
+        if (ctx && Array.isArray(ctx.items) && Number.isFinite(ctx.index)) {
+            preloadAdjacentImages(ctx.items, ctx.index, LIGHTBOX_PRELOAD_NEIGHBORS);
+        }
+    } catch {
+        // ignore
+    }
 }
 function closeLightbox() {
     dom.lightbox.classList.add('opacity-0');
@@ -3330,6 +3560,27 @@ document.addEventListener('keydown', (e) => {
 
 function navigateLightbox(direction) {
     if (!state.currentLightboxSrc) return;
+
+    // Cloud gallery navigation: use cloud context when available.
+    try {
+        const ctx = state.lightboxContext;
+        if (ctx?.type === 'cloud' && Array.isArray(ctx.items) && Number.isFinite(ctx.index) && ctx.items.length > 1) {
+            const len = ctx.items.length;
+            let nextIndex = (ctx.index + direction) % len;
+            if (nextIndex < 0) nextIndex += len;
+
+            const it = ctx.items[nextIndex] || {};
+            const thumb = it.thumbUri || it.thumb_uri || null;
+            const full = it.fileUri || it.file_uri || null;
+            if (!full) return;
+
+            state.lightboxContext = { ...ctx, index: nextIndex };
+            openLightbox(full, thumb);
+            return;
+        }
+    } catch {
+        // ignore
+    }
 
     // 收集当前画布所有对话卡片里的模型图片，按卡片显示顺序 + 消息顺序排列
     const cards = Array.from(dom.grid.querySelectorAll('[id^="card-"]'));
@@ -3377,6 +3628,7 @@ function navigateLightbox(direction) {
     const next = globalImages[nextIndex];
     // 更新当前会话为目标图片所在的对话，实现“跨对话”切换
     state.activeSessionId = next.sessionId;
+    state.lightboxContext = { type: 'cards', items: globalImages.map((img) => img.src), index: nextIndex };
     openLightbox(next.src);
 }
 
