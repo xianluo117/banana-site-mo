@@ -728,6 +728,16 @@ function openCloudPickerForChat(sessionId) {
     switchCloudImagesTab(cloudImagesState.tab || 'uploads');
 }
 
+function openCloudPickerForGlobal() {
+    cloudImagesState.manage = false;
+    cloudImagesState.picker = { type: 'global' };
+    cloudImagesState.pickerSelected = new Set();
+    updateCloudManageButton();
+    updateCloudPickerUI();
+    toggleCloudImagesModal(true);
+    switchCloudImagesTab(cloudImagesState.tab || 'uploads');
+}
+
 function closeCloudPicker() {
     cloudImagesState.picker = null;
     cloudImagesState.pickerSelected = new Set();
@@ -739,9 +749,11 @@ async function confirmCloudPickerSelection() {
     const ctx = cloudImagesState.picker;
     if (!ctx) return;
     const selected = Array.from(cloudImagesState.pickerSelected || []);
+    const items = (cloudImagesState.items || []).filter((it) => selected.includes(it.fileUri || it.file_uri));
     if (ctx.type === 'chat') {
-        const items = (cloudImagesState.items || []).filter((it) => selected.includes(it.fileUri || it.file_uri));
         await attachCloudImagesToChat(ctx.sessionId, items);
+    } else if (ctx.type === 'global') {
+        attachCloudImagesToGlobal(items);
     }
     closeCloudPicker();
 }
@@ -1541,15 +1553,28 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     dom.mediaPickLocalBtn?.addEventListener('click', () => {
         toggleMediaSourceModal(false);
-        if (!dom.chatFileInput) return;
-        dom.chatFileInput.value = '';
-        dom.chatFileInput.click();
+        const ctx = runtime.mediaPickContext;
+        if (ctx?.type === 'chat') {
+            if (!dom.chatFileInput) return;
+            dom.chatFileInput.value = '';
+            dom.chatFileInput.click();
+            return;
+        }
+        // default: global picker uses main file input
+        if (!dom.fileInput) return;
+        dom.fileInput.value = '';
+        dom.fileInput.click();
     });
     dom.mediaPickCloudBtn?.addEventListener('click', () => {
         toggleMediaSourceModal(false);
-        if (!state.activeSessionId) return;
-        runtime.mediaPickContext = { type: 'chat', sessionId: state.activeSessionId };
-        openCloudPickerForChat(state.activeSessionId);
+        const ctx = runtime.mediaPickContext;
+        if (ctx?.type === 'chat') {
+            if (!state.activeSessionId) return;
+            openCloudPickerForChat(state.activeSessionId);
+            return;
+        }
+        // default: global picker
+        openCloudPickerForGlobal();
     });
     dom.importLibFile.addEventListener('change', handleLibraryImport);
 
@@ -3802,6 +3827,11 @@ function openChatMediaPicker() {
     toggleMediaSourceModal(true);
 }
 
+function openMainMediaPicker() {
+    runtime.mediaPickContext = { type: 'global' };
+    toggleMediaSourceModal(true);
+}
+
 async function attachCloudImagesToChat(sessionId, items) {
     const targetSessionId = sessionId || runtime.mediaPickContext?.sessionId;
     if (!targetSessionId) return;
@@ -3815,6 +3845,16 @@ async function attachCloudImagesToChat(sessionId, items) {
         session.attachments.push({ mime: 'image/png', file_uri: fileUri, thumb_uri: thumbUri || null });
     });
     renderChatAttachments();
+}
+
+function attachCloudImagesToGlobal(items) {
+    (items || []).forEach((it) => {
+        const fileUri = it?.fileUri || it?.file_uri;
+        const thumbUri = it?.thumbUri || it?.thumb_uri;
+        if (!fileUri) return;
+        state.images.push({ mime: 'image/png', file_uri: fileUri, thumb_uri: thumbUri || null });
+    });
+    renderPreview();
 }
 
 function stopActiveChat() {
