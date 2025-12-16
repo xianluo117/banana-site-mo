@@ -48,7 +48,8 @@ const runtime = {
     authMode: 'login',
     fileUriToInlineCache: new Map(),
     postLoginAction: null, // { type: 'openCloudImages', tab: 'uploads'|'generated' }
-    imagePreloadCache: new Map()
+    imagePreloadCache: new Map(),
+    mediaPickContext: null // { type: 'chat', sessionId }
 };
 
 function isAuthed() {
@@ -439,6 +440,12 @@ const dom = {
     chatSessionId: document.getElementById('chatSessionId'),
     sendChatBtn: document.getElementById('sendChatBtn'),
     chatStopBtn: document.getElementById('chatStopBtn'),
+    chatAttachBtn: document.getElementById('chatAttachBtn'),
+    chatAttachmentStrip: document.getElementById('chatAttachmentStrip'),
+    chatFileInput: document.getElementById('chatFileInput'),
+    mediaSourceModal: document.getElementById('mediaSourceModal'),
+    mediaPickCloudBtn: document.getElementById('mediaPickCloudBtn'),
+    mediaPickLocalBtn: document.getElementById('mediaPickLocalBtn'),
     leftSidebar: document.getElementById('leftSidebar'),
     mobileSidebarBackdrop: document.getElementById('mobileSidebarBackdrop'),
     lightbox: document.getElementById('lightbox'),
@@ -509,6 +516,10 @@ const dom = {
     cloudImagesManageBtn: document.getElementById('cloudImagesManageBtn'),
     cloudImagesClearBtn: document.getElementById('cloudImagesClearBtn'),
     cloudImagesClearAllBtn: document.getElementById('cloudImagesClearAllBtn'),
+    cloudPickerBar: document.getElementById('cloudPickerBar'),
+    cloudPickerCount: document.getElementById('cloudPickerCount'),
+    cloudPickerCancelBtn: document.getElementById('cloudPickerCancelBtn'),
+    cloudPickerAddBtn: document.getElementById('cloudPickerAddBtn'),
     cloudImagesGrid: document.getElementById('cloudImagesGrid'),
     cloudImagesEmpty: document.getElementById('cloudImagesEmpty'),
     cloudImagesLoadMore: document.getElementById('cloudImagesLoadMore'),
@@ -615,6 +626,8 @@ const cloudImagesState = {
     loading: false,
     usageLoading: false,
     manage: false,
+    picker: null, // { type: 'chat', sessionId }
+    pickerSelected: new Set(),
     items: []
 };
 
@@ -673,12 +686,16 @@ function setupCloudImagesUI() {
     dom.cloudImagesClearBtn?.addEventListener('click', () => clearCloudImages('tab'));
     dom.cloudImagesClearAllBtn?.addEventListener('click', () => clearCloudImages('all'));
     dom.cloudImagesLoadMore?.addEventListener('click', () => loadMoreCloudImages());
+
+    dom.cloudPickerCancelBtn?.addEventListener('click', () => closeCloudPicker());
+    dom.cloudPickerAddBtn?.addEventListener('click', () => confirmCloudPickerSelection());
 }
 
 function switchCloudImagesTab(tab) {
     cloudImagesState.tab = tab === 'generated' ? 'generated' : 'uploads';
     cloudImagesState.manage = false;
     updateCloudManageButton();
+    updateCloudPickerUI();
     if (dom.cloudTabUploads && dom.cloudTabGenerated) {
         const uploadsActive = cloudImagesState.tab === 'uploads';
         dom.cloudTabUploads.className = uploadsActive
@@ -689,6 +706,44 @@ function switchCloudImagesTab(tab) {
             : 'px-3 py-1.5 rounded-lg border bg-gray-900 border-gray-700 text-gray-300 hover:bg-gray-800 text-xs font-medium transition-colors active:scale-95';
     }
     refreshCloudImages().catch(() => {});
+}
+
+function updateCloudPickerUI() {
+    const active = !!cloudImagesState.picker;
+    if (dom.cloudPickerBar) dom.cloudPickerBar.classList.toggle('hidden', !active);
+    if (dom.cloudImagesManageBtn) dom.cloudImagesManageBtn.classList.toggle('hidden', active);
+    if (dom.cloudImagesClearBtn) dom.cloudImagesClearBtn.classList.toggle('hidden', active);
+    if (dom.cloudImagesClearAllBtn) dom.cloudImagesClearAllBtn.classList.toggle('hidden', active);
+    if (dom.cloudPickerCount) dom.cloudPickerCount.textContent = `已选择 ${cloudImagesState.pickerSelected?.size || 0}`;
+}
+
+function openCloudPickerForChat(sessionId) {
+    cloudImagesState.manage = false;
+    cloudImagesState.picker = { type: 'chat', sessionId };
+    cloudImagesState.pickerSelected = new Set();
+    updateCloudManageButton();
+    updateCloudPickerUI();
+    toggleCloudImagesModal(true);
+    // Default to uploads; user can switch tabs
+    switchCloudImagesTab(cloudImagesState.tab || 'uploads');
+}
+
+function closeCloudPicker() {
+    cloudImagesState.picker = null;
+    cloudImagesState.pickerSelected = new Set();
+    updateCloudPickerUI();
+    toggleCloudImagesModal(false);
+}
+
+async function confirmCloudPickerSelection() {
+    const ctx = cloudImagesState.picker;
+    if (!ctx) return;
+    const selected = Array.from(cloudImagesState.pickerSelected || []);
+    if (ctx.type === 'chat') {
+        const items = (cloudImagesState.items || []).filter((it) => selected.includes(it.fileUri || it.file_uri));
+        await attachCloudImagesToChat(ctx.sessionId, items);
+    }
+    closeCloudPicker();
 }
 
 function updateCloudManageButton() {
@@ -704,9 +759,7 @@ function toggleCloudImagesManage() {
     cloudImagesState.manage = !cloudImagesState.manage;
     updateCloudManageButton();
     if (!dom.cloudImagesGrid) return;
-    dom.cloudImagesGrid.innerHTML = '';
-    const items = Array.isArray(cloudImagesState.items) ? cloudImagesState.items : [];
-    renderCloudImages(items, true);
+    rerenderCloudImagesGrid();
 }
 
 async function deleteCloudImage(fileUri) {
@@ -737,32 +790,40 @@ async function clearCloudImages(scope) {
 function toggleCloudImagesModal(show) {
     if (!dom.cloudImagesModal) return;
     if (show && !isAuthed()) {
-        requireLoginFor({ type: 'openCloudImages', tab: cloudImagesState.tab });
+        const action = cloudImagesState.picker
+            ? { type: 'openCloudPicker', tab: cloudImagesState.tab, sessionId: cloudImagesState.picker.sessionId }
+            : { type: 'openCloudImages', tab: cloudImagesState.tab };
+        requireLoginFor(action);
         return;
     }
     dom.cloudImagesModal.classList.toggle('hidden', !show);
     if (show) {
         updateCloudManageButton();
+        updateCloudPickerUI();
         refreshCloudUsage().catch(() => {});
         refreshCloudImages().catch(() => {});
     }
 }
 
-function renderCloudImages(items, append = false) {
+function renderCloudImages(items, append = false, store = true) {
     if (!dom.cloudImagesGrid) return;
     if (!append) dom.cloudImagesGrid.innerHTML = '';
-    if (!append) cloudImagesState.items = [];
-    const startIndex = cloudImagesState.items.length;
+    if (!append && store) cloudImagesState.items = [];
+    const startIndex = store ? cloudImagesState.items.length : 0;
     (items || []).forEach((it, localIdx) => {
-        cloudImagesState.items.push(it);
+        if (store) cloudImagesState.items.push(it);
         const wrap = document.createElement('div');
         wrap.className = 'cloud-gallery-item group relative rounded-lg border border-gray-800 overflow-hidden';
         const thumb = it.thumbUri || it.thumb_uri || null;
         const full = it.fileUri || it.file_uri;
         const src = thumb || full;
         const manage = !!cloudImagesState.manage;
+        const picking = !!cloudImagesState.picker;
+        const picked = picking && cloudImagesState.pickerSelected?.has(full);
         wrap.innerHTML = `
             <img src="${src}" class="cloud-gallery-img" loading="lazy" decoding="async" />
+            ${picking ? `<div class="absolute inset-0 ${picked ? 'bg-blue-600/20' : 'bg-transparent'} pointer-events-none"></div>` : ''}
+            ${picking ? `<div class="absolute top-1.5 left-1.5 z-10 w-7 h-7 rounded-full border ${picked ? 'bg-blue-600 border-blue-400' : 'bg-black/50 border-gray-700'} flex items-center justify-center text-white/90 pointer-events-none">${picked ? '✓' : ''}</div>` : ''}
             ${manage ? `<button type="button" class="cloud-gallery-del absolute top-1.5 right-1.5 z-10 w-8 h-8 rounded-full bg-black/70 hover:bg-red-600/80 border border-gray-700 flex items-center justify-center text-white/90" title="删除">✕</button>` : ''}
             <div class="absolute inset-x-0 bottom-0 p-1 bg-black/50 text-[10px] text-gray-200 opacity-0 group-hover:opacity-100 transition-opacity truncate">
                 ${(it.name || '').toString()}
@@ -778,6 +839,14 @@ function renderCloudImages(items, append = false) {
         }
         wrap.addEventListener('click', (e) => {
             e.preventDefault();
+            if (cloudImagesState.picker && full) {
+                if (!cloudImagesState.pickerSelected) cloudImagesState.pickerSelected = new Set();
+                if (cloudImagesState.pickerSelected.has(full)) cloudImagesState.pickerSelected.delete(full);
+                else cloudImagesState.pickerSelected.add(full);
+                updateCloudPickerUI();
+                rerenderCloudImagesGrid();
+                return;
+            }
             if (cloudImagesState.manage) return;
             state.lightboxContext = { type: 'cloud', items: cloudImagesState.items, index: startIndex + localIdx };
             openLightbox(full, thumb);
@@ -787,6 +856,13 @@ function renderCloudImages(items, append = false) {
 
     const total = dom.cloudImagesGrid.children.length;
     if (dom.cloudImagesEmpty) dom.cloudImagesEmpty.classList.toggle('hidden', total > 0);
+}
+
+function rerenderCloudImagesGrid() {
+    if (!dom.cloudImagesGrid) return;
+    dom.cloudImagesGrid.innerHTML = '';
+    const items = Array.isArray(cloudImagesState.items) ? cloudImagesState.items : [];
+    renderCloudImages(items, true, false);
 }
 
 async function fetchCloudImagesPage(reset = false) {
@@ -803,7 +879,7 @@ async function fetchCloudImagesPage(reset = false) {
         const res = await apiFetchJson(`/api/images/list?${qs.toString()}`);
         const items = Array.isArray(res.items) ? res.items : [];
         cloudImagesState.cursor = res.nextCursor || null;
-        renderCloudImages(items, !reset);
+        renderCloudImages(items, !reset, true);
 
         if (dom.cloudImagesLoadMore) {
             dom.cloudImagesLoadMore.classList.toggle('hidden', !cloudImagesState.cursor);
@@ -857,6 +933,8 @@ async function submitAuth() {
             runtime.postLoginAction = null;
             if (action?.type === 'openCloudImages') {
                 openCloudImages(action.tab);
+            } else if (action?.type === 'openCloudPicker') {
+                openCloudPickerForChat(action.sessionId);
             }
         }
         toggleAuthModal(false);
@@ -1459,6 +1537,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     // File Handlers
     dom.fileInput.addEventListener('change', (e) => handleFileUpload(e.target.files, 'global'));
     dom.builderRowInput.addEventListener('change', (e) => handleFileUpload(e.target.files, 'row'));
+    dom.chatFileInput?.addEventListener('change', (e) => handleFileUpload(e.target.files, 'chat', state.activeSessionId));
+
+    dom.mediaPickLocalBtn?.addEventListener('click', () => {
+        toggleMediaSourceModal(false);
+        if (!dom.chatFileInput) return;
+        dom.chatFileInput.value = '';
+        dom.chatFileInput.click();
+    });
+    dom.mediaPickCloudBtn?.addEventListener('click', () => {
+        toggleMediaSourceModal(false);
+        if (!state.activeSessionId) return;
+        runtime.mediaPickContext = { type: 'chat', sessionId: state.activeSessionId };
+        openCloudPickerForChat(state.activeSessionId);
+    });
     dom.importLibFile.addEventListener('change', handleLibraryImport);
 
     // Drag & Drop
@@ -1790,6 +1882,13 @@ async function handleFileUpload(files, target, rowIdx = null) {
                 state.promptBuilder[idx].images.push(imgObj);
                 renderBuilder();
             }
+        } else if (target === 'chat') {
+            const sessionId = rowIdx !== null ? rowIdx : state.activeSessionId;
+            const session = ensureChatSessionAttachments(sessionId);
+            if (session) {
+                session.attachments.push(imgObj);
+                renderChatAttachments();
+            }
         }
     }
 
@@ -1798,6 +1897,7 @@ async function handleFileUpload(files, target, rowIdx = null) {
     // Reset inputs
     dom.fileInput.value = '';
     dom.builderRowInput.value = '';
+    if (dom.chatFileInput) dom.chatFileInput.value = '';
 }
 
 // --- CONFIGURATION ---
@@ -3581,6 +3681,7 @@ function openChat(id) {
     state.activeSessionId = id;
     dom.chatSessionId.textContent = `ID: ${id}`;
     dom.chatHistory.innerHTML = '';
+    renderChatAttachments();
     state.sessions[id].messages.forEach(msg => renderChatMessage(msg.role, msg.parts));
     toggleChatDrawer(true);
     setTimeout(() => dom.chatHistory.scrollTop = dom.chatHistory.scrollHeight, 100);
@@ -3591,15 +3692,30 @@ function toggleChatDrawer(open) {
 }
 async function sendChatMessage() {
     const txt = dom.chatInput.value.trim();
-    if (!txt || !state.activeSessionId) return;
+    if (!state.activeSessionId) return;
 
     const sessionId = state.activeSessionId;
     const session = state.sessions[sessionId];
     if (!session) return;
 
-    session.messages.push({ role: 'user', parts: [{ text: txt }] });
-    renderChatMessage('user', [{ text: txt }]);
+    const attachments = Array.isArray(session.attachments) ? session.attachments : [];
+    if (!txt && attachments.length === 0) return;
+
+    const parts = [];
+    if (txt) parts.push({ text: txt });
+    attachments.forEach(img => {
+        if (img?.file_uri) {
+            parts.push({ file_data: { mime_type: img.mime || 'image/png', file_uri: img.file_uri } });
+        } else if (img?.data) {
+            parts.push({ inline_data: { mime_type: img.mime || 'image/png', data: img.data } });
+        }
+    });
+
+    session.messages.push({ role: 'user', parts });
+    renderChatMessage('user', parts);
     dom.chatInput.value = '';
+    session.attachments = [];
+    renderChatAttachments();
 
     if (dom.sendChatBtn) {
         dom.sendChatBtn.disabled = true;
@@ -3618,6 +3734,87 @@ async function sendChatMessage() {
             dom.chatStopBtn.disabled = true;
         }
     }
+}
+
+function ensureChatSessionAttachments(sessionId) {
+    const s = state.sessions?.[sessionId];
+    if (!s) return null;
+    if (!Array.isArray(s.attachments)) s.attachments = [];
+    return s;
+}
+
+function renderChatAttachments() {
+    if (!dom.chatAttachmentStrip) return;
+    const sessionId = state.activeSessionId;
+    if (!sessionId) {
+        dom.chatAttachmentStrip.classList.add('hidden');
+        dom.chatAttachmentStrip.innerHTML = '';
+        return;
+    }
+    const session = ensureChatSessionAttachments(sessionId);
+    const list = session?.attachments || [];
+    if (!list.length) {
+        dom.chatAttachmentStrip.classList.add('hidden');
+        dom.chatAttachmentStrip.innerHTML = '';
+        return;
+    }
+
+    dom.chatAttachmentStrip.classList.remove('hidden');
+    dom.chatAttachmentStrip.innerHTML = '';
+    list.forEach((img, idx) => {
+        const src = img.thumb_uri || img.b64 || img.file_uri || '';
+        const wrap = document.createElement('div');
+        wrap.className = 'relative group w-16 h-16 rounded-lg border border-gray-700 bg-black/20 overflow-hidden';
+        wrap.innerHTML = `
+            <img src="${src}" class="w-full h-full object-contain" loading="lazy" decoding="async" />
+            <button type="button" class="absolute -top-2 -right-2 w-7 h-7 rounded-full bg-red-600/90 hover:bg-red-500 text-white flex items-center justify-center border border-red-400/30 opacity-0 group-hover:opacity-100 transition-opacity" title="移除">
+                <span class="material-symbols-rounded text-[16px]">close</span>
+            </button>
+        `;
+        const btn = wrap.querySelector('button');
+        if (btn) {
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                const s = ensureChatSessionAttachments(sessionId);
+                if (!s) return;
+                s.attachments.splice(idx, 1);
+                renderChatAttachments();
+            });
+        }
+        wrap.addEventListener('click', () => {
+            const full = img.file_uri || img.b64;
+            const preview = img.thumb_uri || null;
+            if (full) openLightbox(full, preview);
+        });
+        dom.chatAttachmentStrip.appendChild(wrap);
+    });
+}
+
+function toggleMediaSourceModal(show) {
+    if (!dom.mediaSourceModal) return;
+    dom.mediaSourceModal.classList.toggle('hidden', !show);
+}
+
+function openChatMediaPicker() {
+    if (!state.activeSessionId) return;
+    runtime.mediaPickContext = { type: 'chat', sessionId: state.activeSessionId };
+    toggleMediaSourceModal(true);
+}
+
+async function attachCloudImagesToChat(sessionId, items) {
+    const targetSessionId = sessionId || runtime.mediaPickContext?.sessionId;
+    if (!targetSessionId) return;
+    const session = ensureChatSessionAttachments(targetSessionId);
+    if (!session) return;
+
+    (items || []).forEach((it) => {
+        const fileUri = it?.fileUri || it?.file_uri;
+        const thumbUri = it?.thumbUri || it?.thumb_uri;
+        if (!fileUri) return;
+        session.attachments.push({ mime: 'image/png', file_uri: fileUri, thumb_uri: thumbUri || null });
+    });
+    renderChatAttachments();
 }
 
 function stopActiveChat() {
