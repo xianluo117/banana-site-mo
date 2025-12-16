@@ -389,6 +389,9 @@ const dom = {
     cloudTabUploads: document.getElementById('cloudTabUploads'),
     cloudTabGenerated: document.getElementById('cloudTabGenerated'),
     cloudImagesRefreshBtn: document.getElementById('cloudImagesRefreshBtn'),
+    cloudImagesManageBtn: document.getElementById('cloudImagesManageBtn'),
+    cloudImagesClearBtn: document.getElementById('cloudImagesClearBtn'),
+    cloudImagesClearAllBtn: document.getElementById('cloudImagesClearAllBtn'),
     cloudImagesGrid: document.getElementById('cloudImagesGrid'),
     cloudImagesEmpty: document.getElementById('cloudImagesEmpty'),
     cloudImagesLoadMore: document.getElementById('cloudImagesLoadMore'),
@@ -494,6 +497,7 @@ const cloudImagesState = {
     cursor: null,
     loading: false,
     usageLoading: false,
+    manage: false,
     items: []
 };
 
@@ -548,11 +552,16 @@ function setupCloudImagesUI() {
     dom.cloudTabUploads?.addEventListener('click', () => switchCloudImagesTab('uploads'));
     dom.cloudTabGenerated?.addEventListener('click', () => switchCloudImagesTab('generated'));
     dom.cloudImagesRefreshBtn?.addEventListener('click', () => refreshCloudImages());
+    dom.cloudImagesManageBtn?.addEventListener('click', () => toggleCloudImagesManage());
+    dom.cloudImagesClearBtn?.addEventListener('click', () => clearCloudImages('tab'));
+    dom.cloudImagesClearAllBtn?.addEventListener('click', () => clearCloudImages('all'));
     dom.cloudImagesLoadMore?.addEventListener('click', () => loadMoreCloudImages());
 }
 
 function switchCloudImagesTab(tab) {
     cloudImagesState.tab = tab === 'generated' ? 'generated' : 'uploads';
+    cloudImagesState.manage = false;
+    updateCloudManageButton();
     if (dom.cloudTabUploads && dom.cloudTabGenerated) {
         const uploadsActive = cloudImagesState.tab === 'uploads';
         dom.cloudTabUploads.className = uploadsActive
@@ -565,6 +574,49 @@ function switchCloudImagesTab(tab) {
     refreshCloudImages().catch(() => {});
 }
 
+function updateCloudManageButton() {
+    if (!dom.cloudImagesManageBtn) return;
+    const on = !!cloudImagesState.manage;
+    dom.cloudImagesManageBtn.className = on
+        ? 'ml-auto px-3 py-1.5 rounded-lg border bg-blue-600 border-blue-500 text-white text-xs font-medium transition-colors active:scale-95'
+        : 'ml-auto px-3 py-1.5 rounded-lg border border-gray-700 bg-gray-900/50 text-gray-300 hover:bg-gray-800 text-xs font-medium transition-colors active:scale-95';
+    dom.cloudImagesManageBtn.textContent = on ? '完成' : '管理';
+}
+
+function toggleCloudImagesManage() {
+    cloudImagesState.manage = !cloudImagesState.manage;
+    updateCloudManageButton();
+    if (!dom.cloudImagesGrid) return;
+    dom.cloudImagesGrid.innerHTML = '';
+    const items = Array.isArray(cloudImagesState.items) ? cloudImagesState.items : [];
+    renderCloudImages(items, true);
+}
+
+async function deleteCloudImage(fileUri) {
+    if (!isAuthed()) return;
+    const target = String(fileUri || '');
+    if (!target) return;
+    if (!confirm('确认删除这张图片？')) return;
+    await apiFetchJson('/api/images/delete', { method: 'POST', json: { fileUri: target } });
+    await refreshCloudUsage().catch(() => {});
+    await refreshCloudImages();
+}
+
+async function clearCloudImages(scope) {
+    if (!isAuthed()) return;
+    const isAll = scope === 'all';
+    const kind = isAll ? 'all' : cloudImagesState.tab;
+    const hint = isAll
+        ? '确认清空【上传+生成】全部云图库？此操作不可恢复。'
+        : '确认清空当前云图库？此操作不可恢复。';
+    if (!confirm(hint)) return;
+    await apiFetchJson('/api/images/clear', { method: 'POST', json: { kind } });
+    cloudImagesState.manage = false;
+    updateCloudManageButton();
+    await refreshCloudUsage().catch(() => {});
+    await refreshCloudImages();
+}
+
 function toggleCloudImagesModal(show) {
     if (!dom.cloudImagesModal) return;
     if (show && !isAuthed()) {
@@ -573,6 +625,7 @@ function toggleCloudImagesModal(show) {
     }
     dom.cloudImagesModal.classList.toggle('hidden', !show);
     if (show) {
+        updateCloudManageButton();
         refreshCloudUsage().catch(() => {});
         refreshCloudImages().catch(() => {});
     }
@@ -590,14 +643,25 @@ function renderCloudImages(items, append = false) {
         const thumb = it.thumbUri || it.thumb_uri || null;
         const full = it.fileUri || it.file_uri;
         const src = thumb || full;
+        const manage = !!cloudImagesState.manage;
         wrap.innerHTML = `
             <img src="${src}" class="cloud-gallery-img" loading="lazy" decoding="async" />
+            ${manage ? `<button type="button" class="cloud-gallery-del absolute top-1.5 right-1.5 z-10 w-8 h-8 rounded-full bg-black/70 hover:bg-red-600/80 border border-gray-700 flex items-center justify-center text-white/90" title="删除">✕</button>` : ''}
             <div class="absolute inset-x-0 bottom-0 p-1 bg-black/50 text-[10px] text-gray-200 opacity-0 group-hover:opacity-100 transition-opacity truncate">
                 ${(it.name || '').toString()}
             </div>
         `;
+        const delBtn = wrap.querySelector('.cloud-gallery-del');
+        if (delBtn) {
+            delBtn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                deleteCloudImage(full).catch((err) => alert(err?.message || '删除失败'));
+            });
+        }
         wrap.addEventListener('click', (e) => {
             e.preventDefault();
+            if (cloudImagesState.manage) return;
             state.lightboxContext = { type: 'cloud', items: cloudImagesState.items, index: startIndex + localIdx };
             openLightbox(full, thumb);
         });

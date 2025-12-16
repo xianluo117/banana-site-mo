@@ -358,6 +358,60 @@ async function addUsage(username, kind, bytes) {
   await writeUsage(username, usage);
 }
 
+async function changeUsage(username, kind, deltaBytes) {
+  if (!['uploads', 'generated'].includes(kind)) return;
+  const usage = await readUsage(username);
+  const d = Number.isFinite(deltaBytes) ? deltaBytes : 0;
+  if (kind === 'uploads') usage.uploadsBytes = Math.max(0, usage.uploadsBytes + d);
+  if (kind === 'generated') usage.generatedBytes = Math.max(0, usage.generatedBytes + d);
+  await writeUsage(username, usage);
+}
+
+async function safeStatSize(absPath) {
+  try {
+    const s = await fsp.stat(absPath);
+    if (!s.isFile()) return 0;
+    return s.size || 0;
+  } catch (e) {
+    if (e.code === 'ENOENT') return 0;
+    throw e;
+  }
+}
+
+async function safeUnlink(absPath) {
+  try {
+    await fsp.unlink(absPath);
+    return true;
+  } catch (e) {
+    if (e.code === 'ENOENT') return false;
+    throw e;
+  }
+}
+
+async function removeDirContentsRecursive(dirPath) {
+  try {
+    const entries = await fsp.readdir(dirPath, { withFileTypes: true });
+    for (const e of entries) {
+      const abs = path.join(dirPath, e.name);
+      if (e.isDirectory()) {
+        await removeDirContentsRecursive(abs);
+        try {
+          await fsp.rmdir(abs);
+        } catch {
+          // ignore
+        }
+        continue;
+      }
+      if (e.isFile()) {
+        await safeUnlink(abs);
+      }
+    }
+  } catch (e) {
+    if (e.code === 'ENOENT') return;
+    throw e;
+  }
+}
+
 async function saveUserMeta(username, meta) {
   const metaPath = path.join(USERS_ROOT, username, 'meta.json');
   await writeJsonAtomic(metaPath, meta);
@@ -851,6 +905,67 @@ async function main() {
         await addUsage(auth.u, kind, thumbParsed.buf.length);
         const thumbUri = `/files/${encodeURIComponent(auth.u)}/${kind}/thumbs/${encodeURIComponent(path.basename(thumbPath))}`;
         return sendJson(res, 200, { ok: true, thumbUri });
+      }
+
+      if (pathname === '/api/images/delete' && req.method === 'POST') {
+        const auth = requireAuth(secret, req);
+        if (!auth) return sendJson(res, 401, { error: 'Unauthorized' });
+        const body = await readJsonBody(req);
+        const fileUri = String(body.fileUri || '');
+
+        const m = fileUri.match(/^\/files\/([^/]+)\/(uploads|generated)\/([^/?#]+)$/);
+        if (!m) return sendJson(res, 400, { error: 'Invalid fileUri' });
+
+        const userFromUri = decodeURIComponent(m[1]);
+        const kind = m[2];
+        const fileName = decodeURIComponent(m[3]);
+
+        if (userFromUri !== auth.u) return sendJson(res, 403, { error: 'Forbidden' });
+        if (fileName.includes('/') || fileName.includes('\\')) return sendJson(res, 400, { error: 'Bad filename' });
+        if (fileName.toLowerCase().endsWith('.webp') && fileUri.includes('/thumbs/')) {
+          return sendJson(res, 400, { error: 'Bad target' });
+        }
+
+        const baseDir = path.join(USERS_ROOT, auth.u);
+        const absPath = path.join(baseDir, kind, fileName);
+        if (!absPath.startsWith(baseDir)) return sendJson(res, 400, { error: 'Bad path' });
+
+        const removedBytes = await safeStatSize(absPath);
+        const existed = await safeUnlink(absPath);
+        if (existed && removedBytes) {
+          await changeUsage(auth.u, kind, -removedBytes);
+        }
+
+        const thumbPath = getThumbPathForImagePath(absPath);
+        const thumbBytes = await safeStatSize(thumbPath);
+        const thumbExisted = await safeUnlink(thumbPath);
+        if (thumbExisted && thumbBytes) {
+          await changeUsage(auth.u, kind, -thumbBytes);
+        }
+
+        return sendJson(res, 200, { ok: true });
+      }
+
+      if (pathname === '/api/images/clear' && req.method === 'POST') {
+        const auth = requireAuth(secret, req);
+        if (!auth) return sendJson(res, 401, { error: 'Unauthorized' });
+        const body = await readJsonBody(req);
+        const kindRaw = String(body.kind || '').toLowerCase();
+        const kinds = kindRaw === 'all' ? ['uploads', 'generated'] : [kindRaw];
+        if (!kinds.every((k) => ['uploads', 'generated'].includes(k))) {
+          return sendJson(res, 400, { error: 'Invalid kind' });
+        }
+
+        const baseDir = path.join(USERS_ROOT, auth.u);
+        for (const k of kinds) {
+          const targetDir = path.join(baseDir, k);
+          await ensureDir(targetDir);
+          await removeDirContentsRecursive(targetDir);
+          await ensureDir(targetDir);
+        }
+
+        const usage = await recomputeUsage(auth.u);
+        return sendJson(res, 200, { ok: true, usage });
       }
 
       if (pathname === '/api/images/fetch' && req.method === 'POST') {
