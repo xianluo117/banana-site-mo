@@ -2561,7 +2561,7 @@ async function executeSessionTurn(sessionId, configOverride = null, isRetry = fa
                 if (!creds) {
                     throw new Error('Vertex: 未配置 Keys（格式：API_KEY|PROJECT_ID）');
                 }
-                const location = 'us-central1';
+                const location = 'global';
                 const publisher = 'google';
 
                 url = `${base}/${ver}/projects/${creds.projectId}/locations/${location}/publishers/${publisher}/models/${model}:streamGenerateContent?key=${creds.key}`;
