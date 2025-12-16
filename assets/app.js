@@ -36,6 +36,7 @@ const state = {
         customJson: ""
     },
     apiFormat: 'gemini', // 'gemini' or 'openai'
+    vertexLocation: 'global', // 'global' or 'us-central1'
     activeBuilderRowIdx: null,
     cardSize: (typeof localStorage !== 'undefined' && localStorage.getItem('gem_card_size')) || 'md',
     cardDensity: (typeof localStorage !== 'undefined' && parseInt(localStorage.getItem('gem_card_density') || '3', 10)) || 3
@@ -411,6 +412,7 @@ const dom = {
     modelId: document.getElementById('modelId'),
     vertexKeysContainer: document.getElementById('vertexKeysContainer'),
     vertexKeysInput: document.getElementById('vertexKeysInput'),
+    vertexLocationContainer: document.getElementById('vertexLocationContainer'),
     concRange: document.getElementById('concRange'),
     concVal: document.getElementById('concVal'),
     tempRange: document.getElementById('tempRange'),
@@ -1355,6 +1357,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if(localStorage.getItem('gem_key')) dom.apiKey.value = localStorage.getItem('gem_key');
     if(localStorage.getItem('gem_model')) dom.modelId.value = localStorage.getItem('gem_model');
     state.apiFormat = localStorage.getItem('gem_api_format') || 'gemini';
+    state.vertexLocation = localStorage.getItem('gem_vertex_location') || 'global';
     state.collections = JSON.parse(localStorage.getItem('gem_collections_v1.0') || '[]'); // 从 localStorage 加载合集
 
     setupCloudImagesUI();
@@ -1902,6 +1905,18 @@ function setupConfigListeners() {
       localStorage.setItem('gem_ver', dom.apiVersion.value);
       updateLiveEndpoint();
   });
+
+    const vertexLocationGroup = document.getElementById('vertexLocationGroup');
+    if (vertexLocationGroup) {
+        vertexLocationGroup.addEventListener('click', (e) => {
+            const btn = e.target.closest('button[data-value]');
+            if (!btn) return;
+            const val = String(btn.dataset.value || '').trim();
+            state.vertexLocation = (val === 'us-central1' || val === 'global') ? val : 'global';
+            localStorage.setItem('gem_vertex_location', state.vertexLocation);
+            applyGroupActiveStyles('vertexLocationGroup', state.vertexLocation);
+        });
+    }
 }
 
 function updateConfigPreview() {
@@ -2023,6 +2038,10 @@ function updateApiFormatUI() {
     applyGroupActiveStyles('apiFormatGroup', state.apiFormat);
     if (dom.vertexKeysContainer) {
         dom.vertexKeysContainer.classList.toggle('hidden', state.apiFormat !== 'vertex');
+    }
+    if (state.apiFormat === 'vertex') {
+        const loc = (state.vertexLocation === 'us-central1' || state.vertexLocation === 'global') ? state.vertexLocation : 'global';
+        applyGroupActiveStyles('vertexLocationGroup', loc);
     }
 }
 
@@ -2561,7 +2580,9 @@ async function executeSessionTurn(sessionId, configOverride = null, isRetry = fa
                 if (!creds) {
                     throw new Error('Vertex: 未配置 Keys（格式：API_KEY|PROJECT_ID）');
                 }
-                const location = 'global';
+                const location = (state.vertexLocation === 'us-central1' || state.vertexLocation === 'global')
+                    ? state.vertexLocation
+                    : 'global';
                 const publisher = 'google';
 
                 url = `${base}/${ver}/projects/${creds.projectId}/locations/${location}/publishers/${publisher}/models/${model}:streamGenerateContent?key=${creds.key}`;
