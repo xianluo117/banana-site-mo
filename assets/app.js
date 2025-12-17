@@ -2164,6 +2164,20 @@ function updateApiFormatUI() {
     if (dom.vertexKeysContainer) {
         dom.vertexKeysContainer.classList.toggle('hidden', state.apiFormat !== 'vertex');
     }
+
+    // Vertex uses Vertex Keys (API_KEY|PROJECT_ID), so the single API key field is optional.
+    try {
+        const isVertex = state.apiFormat === 'vertex';
+        if (dom.apiKey) {
+            dom.apiKey.disabled = isVertex;
+            dom.apiKey.classList.toggle('opacity-60', isVertex);
+            dom.apiKey.classList.toggle('cursor-not-allowed', isVertex);
+            dom.apiKey.placeholder = isVertex ? 'Vertex 模式不需要（使用 Vertex Keys）' : '粘贴密钥...';
+        }
+    } catch {
+        // ignore
+    }
+
     if (state.apiFormat === 'vertex') {
         const loc = (state.vertexLocation === 'us-central1' || state.vertexLocation === 'global') ? state.vertexLocation : 'global';
         applyGroupActiveStyles('vertexLocationGroup', loc);
