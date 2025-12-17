@@ -605,6 +605,62 @@ function ensureUserOwnsPath(auth, username) {
   return auth && (auth.u === username || auth.a === true);
 }
 
+function normalizeApiFormat(fmt) {
+  const v = String(fmt || '').toLowerCase().trim();
+  if (v === 'openai' || v === 'vertex' || v === 'gemini') return v;
+  return 'gemini';
+}
+
+function apiConfigKeyForUser(secret, username) {
+  return crypto.createHash('md5').update(`${secret}|${username}`).digest(); // 16 bytes -> AES-128
+}
+
+function encryptForUser(secret, username, payloadObj) {
+  const key = apiConfigKeyForUser(secret, username);
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-128-gcm', key, iv);
+  const plain = Buffer.from(JSON.stringify(payloadObj || {}), 'utf8');
+  const enc = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return {
+    v: 1,
+    alg: 'aes-128-gcm',
+    iv: iv.toString('base64'),
+    tag: tag.toString('base64'),
+    data: enc.toString('base64'),
+  };
+}
+
+function decryptForUser(secret, username, blob) {
+  if (!blob || typeof blob !== 'object') throw Object.assign(new Error('Invalid blob'), { statusCode: 400 });
+  if (blob.alg !== 'aes-128-gcm') throw Object.assign(new Error('Unsupported alg'), { statusCode: 400 });
+  const key = apiConfigKeyForUser(secret, username);
+  const iv = Buffer.from(String(blob.iv || ''), 'base64');
+  const tag = Buffer.from(String(blob.tag || ''), 'base64');
+  const data = Buffer.from(String(blob.data || ''), 'base64');
+  const decipher = crypto.createDecipheriv('aes-128-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  const plain = Buffer.concat([decipher.update(data), decipher.final()]);
+  return JSON.parse(plain.toString('utf8') || '{}');
+}
+
+function apiConfigsPath(username) {
+  return path.join(USERS_ROOT, username, 'settings', 'api-configs.json');
+}
+
+async function readUserApiConfigs(username) {
+  const p = apiConfigsPath(username);
+  const raw = await readJson(p, null);
+  if (raw && typeof raw === 'object' && raw.items && typeof raw.items === 'object') return raw;
+  return { version: 1, items: { gemini: [], openai: [], vertex: [] } };
+}
+
+async function writeUserApiConfigs(username, obj) {
+  const p = apiConfigsPath(username);
+  await ensureDir(path.dirname(p));
+  await writeJsonAtomic(p, obj);
+}
+
 function walkAndReplace(obj, replacer) {
   if (Array.isArray(obj)) {
     for (let i = 0; i < obj.length; i++) obj[i] = walkAndReplace(obj[i], replacer);
@@ -1274,6 +1330,104 @@ async function main() {
         const list = await readJson(favPath, []);
         const next = list.filter((x) => String(x?.id) !== String(id));
         await writeJsonAtomic(favPath, next);
+        return sendJson(res, 200, { ok: true });
+      }
+
+      if (pathname === '/api/api-configs/list' && req.method === 'GET') {
+        const auth = requireAuth(secret, req);
+        if (!auth) return sendJson(res, 401, { error: 'Unauthorized' });
+        const apiFormat = normalizeApiFormat(url.searchParams.get('apiFormat'));
+        const store = await readUserApiConfigs(auth.u);
+        const list = Array.isArray(store.items?.[apiFormat]) ? store.items[apiFormat] : [];
+        return sendJson(res, 200, {
+          items: list.map((x) => ({ id: x.id, name: x.name, createdAt: x.createdAt, updatedAt: x.updatedAt })),
+          limit: 2,
+          apiFormat,
+        });
+      }
+
+      if (pathname === '/api/api-configs/save' && req.method === 'POST') {
+        const auth = requireAuth(secret, req);
+        if (!auth) return sendJson(res, 401, { error: 'Unauthorized' });
+        const body = await readJsonBody(req);
+        const apiFormat = normalizeApiFormat(body.apiFormat);
+        const name = String(body.name || '').trim();
+        const config = body.config && typeof body.config === 'object' ? body.config : null;
+        if (!name) return sendJson(res, 400, { error: '缺少名称' });
+        if (!config) return sendJson(res, 400, { error: '缺少配置' });
+
+        const payload = {
+          apiFormat,
+          baseUrl: String(config.baseUrl || config.url || '').trim(),
+          apiVersion: String(config.apiVersion || '').trim(),
+          apiKey: String(config.apiKey || '').trim(),
+          modelId: String(config.modelId || '').trim(),
+          vertexLocation: String(config.vertexLocation || '').trim(),
+          vertexKeysRaw: String(config.vertexKeysRaw || '').trim(),
+        };
+
+        if (!payload.baseUrl) return sendJson(res, 400, { error: '缺少 Base URL' });
+        if (apiFormat !== 'vertex' && !payload.apiKey) return sendJson(res, 400, { error: '缺少 API Key' });
+
+        const store = await readUserApiConfigs(auth.u);
+        if (!store.items) store.items = { gemini: [], openai: [], vertex: [] };
+        if (!Array.isArray(store.items.gemini)) store.items.gemini = [];
+        if (!Array.isArray(store.items.openai)) store.items.openai = [];
+        if (!Array.isArray(store.items.vertex)) store.items.vertex = [];
+
+        const list = store.items[apiFormat];
+        const now = nowIso();
+        const existing = list.find((x) => String(x?.name) === name);
+        const enc = encryptForUser(secret, auth.u, payload);
+        if (existing) {
+          existing.updatedAt = now;
+          existing.enc = enc;
+          await writeUserApiConfigs(auth.u, store);
+          return sendJson(res, 200, { ok: true, item: { id: existing.id, name: existing.name, createdAt: existing.createdAt, updatedAt: existing.updatedAt } });
+        }
+
+        if (list.length >= 2) {
+          return sendJson(res, 400, { error: '每种 API 格式最多只能保存 2 个云端配置，请先删除一个旧配置。' });
+        }
+
+        const item = {
+          id: crypto.randomUUID(),
+          name,
+          createdAt: now,
+          updatedAt: now,
+          enc,
+        };
+        list.unshift(item);
+        await writeUserApiConfigs(auth.u, store);
+        return sendJson(res, 200, { ok: true, item: { id: item.id, name: item.name, createdAt: item.createdAt, updatedAt: item.updatedAt } });
+      }
+
+      if (pathname === '/api/api-configs/load' && req.method === 'POST') {
+        const auth = requireAuth(secret, req);
+        if (!auth) return sendJson(res, 401, { error: 'Unauthorized' });
+        const body = await readJsonBody(req);
+        const apiFormat = normalizeApiFormat(body.apiFormat);
+        const id = String(body.id || '').trim();
+        if (!id) return sendJson(res, 400, { error: '缺少 id' });
+        const store = await readUserApiConfigs(auth.u);
+        const list = Array.isArray(store.items?.[apiFormat]) ? store.items[apiFormat] : [];
+        const found = list.find((x) => String(x?.id) === id);
+        if (!found) return sendJson(res, 404, { error: 'Not found' });
+        const config = decryptForUser(secret, auth.u, found.enc);
+        return sendJson(res, 200, { ok: true, config });
+      }
+
+      if (pathname === '/api/api-configs/delete' && req.method === 'POST') {
+        const auth = requireAuth(secret, req);
+        if (!auth) return sendJson(res, 401, { error: 'Unauthorized' });
+        const body = await readJsonBody(req);
+        const apiFormat = normalizeApiFormat(body.apiFormat);
+        const id = String(body.id || '').trim();
+        if (!id) return sendJson(res, 400, { error: '缺少 id' });
+        const store = await readUserApiConfigs(auth.u);
+        const list = Array.isArray(store.items?.[apiFormat]) ? store.items[apiFormat] : [];
+        store.items[apiFormat] = list.filter((x) => String(x?.id) !== id);
+        await writeUserApiConfigs(auth.u, store);
         return sendJson(res, 200, { ok: true });
       }
 

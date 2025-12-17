@@ -292,10 +292,45 @@ async function apiFetchJson(apiPath, options = {}) {
 }
 
 // --- API Config Management ---
+function normalizeApiFormat(fmt) {
+    const v = String(fmt || '').toLowerCase().trim();
+    if (v === 'openai' || v === 'vertex' || v === 'gemini') return v;
+    return 'gemini';
+}
+
+function baseKeyForFormat(fmt) {
+    return `gem_base_${normalizeApiFormat(fmt)}`;
+}
+
+function defaultBaseUrlForFormat(fmt) {
+    const f = normalizeApiFormat(fmt);
+    if (f === 'openai') return 'https://api.openai.com';
+    if (f === 'vertex') return 'https://aiplatform.googleapis.com';
+    return 'https://generativelanguage.googleapis.com';
+}
+
+function getBaseUrlForFormat(fmt) {
+    const key = baseKeyForFormat(fmt);
+    const stored = localStorage.getItem(key);
+    if (stored) return stored;
+    // backward compatibility (older builds stored a single base)
+    const legacy = localStorage.getItem('gem_base');
+    if (legacy) return legacy;
+    return defaultBaseUrlForFormat(fmt);
+}
+
+function persistBaseUrlForFormat(fmt, url) {
+    const f = normalizeApiFormat(fmt);
+    const v = String(url || '').trim();
+    localStorage.setItem(baseKeyForFormat(f), v);
+    // keep a legacy "last used" copy for compatibility with older code/exports
+    localStorage.setItem('gem_base', v);
+}
+
 function saveApiConfig() {
     const url = dom.baseUrl.value.trim();
     const key = dom.apiKey.value.trim();
-    const apiFormat = state.apiFormat || 'gemini';
+    const apiFormat = normalizeApiFormat(state.apiFormat || 'gemini');
 
     if (!url || (apiFormat !== 'vertex' && !key)) {
         alert('URL和密钥不能为空');
@@ -326,12 +361,12 @@ function loadApiConfig(index) {
         dom.baseUrl.value = cfg.url;
         dom.apiKey.value = cfg.key || '';
         // 同时更新localStorage中的当前值
-        localStorage.setItem('gem_base', dom.baseUrl.value);
+        persistBaseUrlForFormat(cfg.apiFormat || state.apiFormat || 'gemini', dom.baseUrl.value);
         localStorage.setItem('gem_key', dom.apiKey.value);
 
         // 如果保存了 API 格式，则一并恢复
         if (cfg.apiFormat) {
-            state.apiFormat = cfg.apiFormat;
+            state.apiFormat = normalizeApiFormat(cfg.apiFormat);
             localStorage.setItem('gem_api_format', state.apiFormat);
 
             // 与按钮点击逻辑保持一致：不同格式自动应用合适的版本 / 端点
@@ -340,20 +375,20 @@ function loadApiConfig(index) {
                 // 如果当前还是 Gemini 默认地址，则自动切换到 OpenAI 官方地址
                 if (!dom.baseUrl.value || dom.baseUrl.value.includes('generativelanguage.googleapis.com')) {
                     dom.baseUrl.value = 'https://api.openai.com';
-                    localStorage.setItem('gem_base', dom.baseUrl.value);
+                    persistBaseUrlForFormat('openai', dom.baseUrl.value);
                 }
             } else if (state.apiFormat === 'vertex') {
                 dom.apiVersion.value = 'v1beta1';
                 if (!dom.baseUrl.value) {
                     dom.baseUrl.value = 'https://aiplatform.googleapis.com';
-                    localStorage.setItem('gem_base', dom.baseUrl.value);
+                    persistBaseUrlForFormat('vertex', dom.baseUrl.value);
                 }
             } else {
                 dom.apiVersion.value = 'v1beta';
                 // 如果当前是 OpenAI 地址，则自动切回 Gemini 默认地址
                 if (!dom.baseUrl.value || dom.baseUrl.value.includes('api.openai.com')) {
                     dom.baseUrl.value = 'https://generativelanguage.googleapis.com';
-                    localStorage.setItem('gem_base', dom.baseUrl.value);
+                    persistBaseUrlForFormat('gemini', dom.baseUrl.value);
                 }
             }
             localStorage.setItem('gem_ver', dom.apiVersion.value);
@@ -403,6 +438,149 @@ function renderApiConfigs() {
         `;
         listEl.appendChild(item);
     });
+}
+
+function renderCloudApiConfigs(list = [], limit = 2) {
+    if (!dom.cloudApiConfigList || !dom.cloudApiConfigContainer) return;
+    if (!isAuthed()) {
+        dom.cloudApiConfigContainer.classList.add('hidden');
+        return;
+    }
+
+    dom.cloudApiConfigContainer.classList.remove('hidden');
+    dom.cloudApiConfigList.innerHTML = '';
+
+    const items = Array.isArray(list) ? list : [];
+    if (items.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'text-[10px] text-gray-500 bg-gray-800/30 border border-gray-800/60 rounded-lg p-2';
+        empty.textContent = `暂无云端配置（当前格式最多 ${limit} 个）`;
+        dom.cloudApiConfigList.appendChild(empty);
+        return;
+    }
+
+    items.forEach((cfg) => {
+        const id = String(cfg?.id || '');
+        const name = String(cfg?.name || '未命名');
+        const item = document.createElement('div');
+        item.className = 'flex items-center justify-between bg-gray-800/50 p-2 rounded-lg text-xs';
+        item.innerHTML = `
+            <div class="flex-1 overflow-hidden mr-2">
+                <div class="font-bold text-gray-300 truncate">${name}</div>
+                <div class="text-gray-500 font-mono text-[10px] truncate">${cfg?.updatedAt ? new Date(cfg.updatedAt).toLocaleString() : ''}</div>
+            </div>
+            <div class="flex items-center gap-1 flex-shrink-0">
+                <button onclick="loadCloudApiConfig('${id}')" class="p-1 text-gray-400 hover:text-green-400 rounded hover:bg-green-900/20 transition-colors" title="加载"><span class="material-symbols-rounded text-sm">login</span></button>
+                <button onclick="deleteCloudApiConfig('${id}')" class="p-1 text-gray-400 hover:text-red-400 rounded hover:bg-red-900/20 transition-colors" title="删除"><span class="material-symbols-rounded text-sm">delete</span></button>
+            </div>
+        `;
+        dom.cloudApiConfigList.appendChild(item);
+    });
+}
+
+async function refreshCloudApiConfigsList() {
+    if (!dom.cloudApiConfigContainer || !dom.cloudApiConfigList) return;
+    if (!isAuthed()) {
+        dom.cloudApiConfigContainer.classList.add('hidden');
+        return;
+    }
+
+    const apiFormat = normalizeApiFormat(state.apiFormat || 'gemini');
+    try {
+        const data = await apiFetchJson(`/api/api-configs/list?apiFormat=${encodeURIComponent(apiFormat)}`);
+        renderCloudApiConfigs(data?.items || [], data?.limit || 2);
+    } catch (e) {
+        dom.cloudApiConfigContainer.classList.remove('hidden');
+        dom.cloudApiConfigList.innerHTML = '';
+        const err = document.createElement('div');
+        err.className = 'text-[10px] text-red-200 bg-red-900/10 border border-red-900/30 rounded-lg p-2';
+        err.textContent = `云端配置加载失败：${e?.message || '未知错误'}`;
+        dom.cloudApiConfigList.appendChild(err);
+    }
+}
+
+async function saveCloudApiConfig() {
+    if (!requireLoginFor({ type: 'cloudApiConfigs' })) return;
+    const apiFormat = normalizeApiFormat(state.apiFormat || 'gemini');
+    const url = String(dom.baseUrl?.value || '').trim();
+    const apiKey = String(dom.apiKey?.value || '').trim();
+    if (!url || (apiFormat !== 'vertex' && !apiKey)) {
+        alert('请先填写 Base URL' + (apiFormat !== 'vertex' ? ' 和 API Key' : ''));
+        return;
+    }
+
+    const suggested = url;
+    const name = prompt('为这个云端配置输入一个名称（同名会覆盖）：', suggested);
+    if (!name) return;
+
+    const config = {
+        apiFormat,
+        baseUrl: url,
+        apiVersion: String(dom.apiVersion?.value || '').trim(),
+        apiKey,
+        modelId: String(dom.modelId?.value || '').trim(),
+        vertexLocation: String(state.vertexLocation || '').trim(),
+        vertexKeysRaw: String(localStorage.getItem('gem_vertex_keys') || dom.vertexKeysInput?.value || '').trim(),
+    };
+
+    await apiFetchJson('/api/api-configs/save', { method: 'POST', json: { apiFormat, name: String(name).trim(), config } });
+    await refreshCloudApiConfigsList();
+    alert('云端配置已保存');
+}
+
+async function loadCloudApiConfig(id) {
+    if (!requireLoginFor({ type: 'cloudApiConfigs' })) return;
+    const apiFormat = normalizeApiFormat(state.apiFormat || 'gemini');
+    const data = await apiFetchJson('/api/api-configs/load', { method: 'POST', json: { apiFormat, id } });
+    const cfg = data?.config || null;
+    if (!cfg) return;
+
+    const fmt = normalizeApiFormat(cfg.apiFormat || apiFormat);
+    state.apiFormat = fmt;
+    localStorage.setItem('gem_api_format', state.apiFormat);
+
+    dom.baseUrl.value = String(cfg.baseUrl || '').trim() || defaultBaseUrlForFormat(fmt);
+    persistBaseUrlForFormat(fmt, dom.baseUrl.value);
+
+    if (cfg.apiVersion != null) {
+        dom.apiVersion.value = String(cfg.apiVersion || '').trim();
+        localStorage.setItem('gem_ver', dom.apiVersion.value);
+    }
+
+    if (fmt === 'vertex') {
+        if (cfg.vertexLocation) {
+            state.vertexLocation = (cfg.vertexLocation === 'us-central1' || cfg.vertexLocation === 'global') ? cfg.vertexLocation : 'global';
+            localStorage.setItem('gem_vertex_location', state.vertexLocation);
+        }
+        if (cfg.vertexKeysRaw != null) {
+            const raw = String(cfg.vertexKeysRaw || '');
+            if (dom.vertexKeysInput) dom.vertexKeysInput.value = raw;
+            vertexKeyManager.updateFromTextarea(raw);
+        }
+        dom.apiKey.value = '';
+        localStorage.setItem('gem_key', '');
+    } else {
+        dom.apiKey.value = String(cfg.apiKey || '').trim();
+        localStorage.setItem('gem_key', dom.apiKey.value);
+    }
+
+    if (cfg.modelId != null) {
+        dom.modelId.value = String(cfg.modelId || '').trim();
+        localStorage.setItem('gem_model', dom.modelId.value);
+    }
+
+    updateApiFormatUI();
+    updateLiveEndpoint();
+    refreshCloudApiConfigsList().catch(() => {});
+    alert('云端配置已加载');
+}
+
+async function deleteCloudApiConfig(id) {
+    if (!requireLoginFor({ type: 'cloudApiConfigs' })) return;
+    if (!confirm('确定要删除这个云端配置吗？')) return;
+    const apiFormat = normalizeApiFormat(state.apiFormat || 'gemini');
+    await apiFetchJson('/api/api-configs/delete', { method: 'POST', json: { apiFormat, id } });
+    await refreshCloudApiConfigsList();
 }
 
 const dom = {
@@ -527,7 +705,12 @@ const dom = {
     sidebarCloudUsageLabel: document.getElementById('sidebarCloudUsageLabel'),
     sidebarOpenGalleryBtn: document.getElementById('sidebarOpenGalleryBtn'),
     sidebarOpenUploadsBtn: document.getElementById('sidebarOpenUploadsBtn'),
-    sidebarOpenGeneratedBtn: document.getElementById('sidebarOpenGeneratedBtn')
+    sidebarOpenGeneratedBtn: document.getElementById('sidebarOpenGeneratedBtn'),
+
+    // Cloud API configs
+    cloudApiConfigContainer: document.getElementById('cloudApiConfigContainer'),
+    cloudApiConfigList: document.getElementById('cloudApiConfigList'),
+    saveCloudApiConfigBtn: document.getElementById('saveCloudApiConfigBtn')
 };
 
 function setAuthError(message) {
@@ -553,9 +736,11 @@ function updateAuthUI() {
 
     if (authed) {
         refreshCloudUsage().catch(() => {});
+        refreshCloudApiConfigsList().catch(() => {});
     } else {
         if (dom.cloudUsageLabel) dom.cloudUsageLabel.textContent = '';
         if (dom.sidebarCloudUsageLabel) dom.sidebarCloudUsageLabel.textContent = '';
+        if (dom.cloudApiConfigContainer) dom.cloudApiConfigContainer.classList.add('hidden');
     }
 }
 
@@ -1442,11 +1627,11 @@ let activeLibraryTab = 'presets';
 
 // --- INIT ---
 document.addEventListener('DOMContentLoaded', async () => {
-    if(localStorage.getItem('gem_base')) dom.baseUrl.value = localStorage.getItem('gem_base');
+    state.apiFormat = normalizeApiFormat(localStorage.getItem('gem_api_format') || 'gemini');
+    dom.baseUrl.value = getBaseUrlForFormat(state.apiFormat);
     if(localStorage.getItem('gem_ver')) dom.apiVersion.value = localStorage.getItem('gem_ver');
     if(localStorage.getItem('gem_key')) dom.apiKey.value = localStorage.getItem('gem_key');
     if(localStorage.getItem('gem_model')) dom.modelId.value = localStorage.getItem('gem_model');
-    state.apiFormat = localStorage.getItem('gem_api_format') || 'gemini';
     state.vertexLocation = localStorage.getItem('gem_vertex_location') || 'global';
     state.collections = JSON.parse(localStorage.getItem('gem_collections_v1.0') || '[]'); // 从 localStorage 加载合集
 
@@ -1466,7 +1651,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (state.apiFormat === 'openai') {
             if (!dom.baseUrl.value || dom.baseUrl.value.includes('generativelanguage.googleapis.com')) {
                 dom.baseUrl.value = 'https://api.openai.com';
-                localStorage.setItem('gem_base', dom.baseUrl.value);
+                persistBaseUrlForFormat('openai', dom.baseUrl.value);
             }
             if (!dom.apiVersion.value) {
                 dom.apiVersion.value = 'v1';
@@ -1475,10 +1660,19 @@ document.addEventListener('DOMContentLoaded', async () => {
         } else if (state.apiFormat === 'gemini') {
             if (!dom.baseUrl.value || dom.baseUrl.value.includes('api.openai.com')) {
                 dom.baseUrl.value = 'https://generativelanguage.googleapis.com';
-                localStorage.setItem('gem_base', dom.baseUrl.value);
+                persistBaseUrlForFormat('gemini', dom.baseUrl.value);
             }
             if (!dom.apiVersion.value) {
                 dom.apiVersion.value = 'v1beta';
+                localStorage.setItem('gem_ver', dom.apiVersion.value);
+            }
+        } else if (state.apiFormat === 'vertex') {
+            if (!dom.baseUrl.value) {
+                dom.baseUrl.value = 'https://aiplatform.googleapis.com';
+                persistBaseUrlForFormat('vertex', dom.baseUrl.value);
+            }
+            if (!dom.apiVersion.value) {
+                dom.apiVersion.value = 'v1beta1';
                 localStorage.setItem('gem_ver', dom.apiVersion.value);
             }
         }
@@ -1501,6 +1695,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderApiConfigs(); // Initial render of saved configs
     vertexKeyManager.loadFromStorage();
     updateApiFormatUI();
+
+    dom.saveCloudApiConfigBtn?.addEventListener('click', () => {
+        saveCloudApiConfig().catch((e) => alert(e?.message || '保存失败'));
+    });
 
     // Theme init
     const savedTheme = localStorage.getItem('gem_theme') || 'dark';
@@ -1590,7 +1788,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.getElementById('fetchModelsBtn').addEventListener('click', fetchModels);
     ['baseUrl', 'apiVersion', 'apiKey'].forEach(id => {
         dom[id].addEventListener('input', () => {
-            localStorage.setItem(id==='baseUrl'?'gem_base':id==='apiVersion'?'gem_ver':'gem_key', dom[id].value);
+            if (id === 'baseUrl') {
+                persistBaseUrlForFormat(state.apiFormat || 'gemini', dom[id].value);
+            } else {
+                localStorage.setItem(id==='apiVersion'?'gem_ver':'gem_key', dom[id].value);
+            }
             updateLiveEndpoint();
         });
     });
@@ -2001,34 +2203,34 @@ function setupConfigListeners() {
         });
     }
      
-    // API Format buttons
+   // API Format buttons
    document.getElementById('apiFormatGroup').addEventListener('click', (e) => {
       const btn = e.target.closest('button[data-value]');
       if (!btn) return;
-      state.apiFormat = btn.dataset.value;
+      // Persist current Base URL for current format before switching
+      persistBaseUrlForFormat(state.apiFormat || 'gemini', dom.baseUrl.value);
+
+      state.apiFormat = normalizeApiFormat(btn.dataset.value);
       localStorage.setItem('gem_api_format', state.apiFormat);
       updateApiFormatUI();
-      
+
       // Auto-update API version for common providers，并在必要时自动切换 Base URL
       if (state.apiFormat === 'openai') {
           dom.apiVersion.value = 'v1';
-          if (!dom.baseUrl.value || dom.baseUrl.value.includes('generativelanguage.googleapis.com')) {
-              dom.baseUrl.value = 'https://api.openai.com';
-              localStorage.setItem('gem_base', dom.baseUrl.value);
-          }
+          dom.baseUrl.value = getBaseUrlForFormat('openai') || defaultBaseUrlForFormat('openai');
+          persistBaseUrlForFormat('openai', dom.baseUrl.value);
       } else if (state.apiFormat === 'vertex') {
           dom.apiVersion.value = 'v1beta1';
-          dom.baseUrl.value = 'https://aiplatform.googleapis.com';
-          localStorage.setItem('gem_base', dom.baseUrl.value);
+          dom.baseUrl.value = getBaseUrlForFormat('vertex') || defaultBaseUrlForFormat('vertex');
+          persistBaseUrlForFormat('vertex', dom.baseUrl.value);
       } else {
           dom.apiVersion.value = 'v1beta';
-          if (!dom.baseUrl.value || dom.baseUrl.value.includes('api.openai.com')) {
-              dom.baseUrl.value = 'https://generativelanguage.googleapis.com';
-              localStorage.setItem('gem_base', dom.baseUrl.value);
-          }
+          dom.baseUrl.value = getBaseUrlForFormat('gemini') || defaultBaseUrlForFormat('gemini');
+          persistBaseUrlForFormat('gemini', dom.baseUrl.value);
       }
       localStorage.setItem('gem_ver', dom.apiVersion.value);
       updateLiveEndpoint();
+      refreshCloudApiConfigsList().catch(() => {});
   });
 
     const vertexLocationGroup = document.getElementById('vertexLocationGroup');
@@ -3277,8 +3479,110 @@ function renderLibrary() {
                 <button onclick="deleteLibraryItem(${idx})" class="p-1.5 text-gray-500 hover:text-red-400 hover:bg-red-900/20 rounded transition-colors active:scale-95"><span class="material-symbols-rounded text-lg">delete</span></button>
             </div>
         `;
+
+        if (activeLibraryTab === 'presets') {
+            const actionRow = div.querySelector('div.flex.items-center.gap-2.opacity-100');
+            if (actionRow) {
+                const exportBtn = document.createElement('button');
+                exportBtn.type = 'button';
+                exportBtn.className = 'px-3 py-1.5 bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-200 text-xs rounded font-medium active:scale-95';
+                exportBtn.textContent = '导出MD';
+                exportBtn.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    exportPresetAsMarkdown(idx);
+                });
+                actionRow.insertBefore(exportBtn, actionRow.firstChild?.nextSibling || actionRow.firstChild);
+            }
+        }
         dom.libraryList.appendChild(div);
     });
+}
+
+function downloadTextFile(fileName, text) {
+    const safeName = String(fileName || '').trim() || `export_${Date.now()}.txt`;
+    const blob = new Blob([String(text || '')], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = safeName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2500);
+}
+
+function presetToMarkdown(preset) {
+    const name = String(preset?.name || '未命名预设');
+    const id = preset?.id != null ? String(preset.id) : '';
+    const created = (() => {
+        const n = Number(id);
+        if (Number.isFinite(n) && n > 0) {
+            try { return new Date(n).toLocaleString(); } catch {}
+        }
+        return '';
+    })();
+
+    const lines = [];
+    lines.push(`# ${name}`);
+    if (id || created) {
+        lines.push('');
+        lines.push(`- id: ${id || 'unknown'}`);
+        if (created) lines.push(`- created: ${created}`);
+        lines.push('');
+    }
+
+    const sys = String(preset?.systemInstruction || '').trim();
+    if (sys) {
+        lines.push('## System Instruction');
+        lines.push('');
+        lines.push(sys);
+        lines.push('');
+    }
+
+    const builder = Array.isArray(preset?.promptBuilder) ? preset.promptBuilder : [];
+    if (builder.length) {
+        lines.push('## Prompt Builder');
+        lines.push('');
+        builder.forEach((msg, idx) => {
+            const role = String(msg?.role || 'user');
+            const text = String(msg?.text || '').trim();
+            lines.push(`### ${idx + 1}. ${role}`);
+            lines.push('');
+            if (text) {
+                lines.push(text);
+                lines.push('');
+            }
+            const images = Array.isArray(msg?.images) ? msg.images : [];
+            if (images.length) {
+                images.forEach((img, i) => {
+                    const u = img?.fileUri || img?.file_uri || img?.url || img?.dataUrl || img?.dataURL || '';
+                    const uri = String(u || '').trim();
+                    if (!uri) return;
+                    if (uri.startsWith('data:image/')) {
+                        lines.push(`- image ${i + 1}: [inline data omitted]`);
+                    } else {
+                        lines.push(`![image ${i + 1}](${uri})`);
+                    }
+                });
+                lines.push('');
+            }
+        });
+    }
+
+    return lines.join('\n').trim() + '\n';
+}
+
+function exportPresetAsMarkdown(index) {
+    const list = Array.isArray(state.presets) ? state.presets : [];
+    const preset = list[index];
+    if (!preset) return;
+    const baseName = (preset?.name || `preset_${preset?.id || Date.now()}`)
+        .toString()
+        .replace(/[\\/:*?"<>|]+/g, '_')
+        .trim() || `preset_${Date.now()}`;
+    const md = presetToMarkdown(preset);
+    downloadTextFile(`${baseName}.md`, md);
 }
 
 async function trySaveFavorite(type, item) {
