@@ -297,7 +297,7 @@ function saveApiConfig() {
     const key = dom.apiKey.value.trim();
     const apiFormat = state.apiFormat || 'gemini';
 
-    if (!url || !key) {
+    if (!url || (apiFormat !== 'vertex' && !key)) {
         alert('URL和密钥不能为空');
         return;
     }
