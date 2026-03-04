@@ -4227,12 +4227,31 @@ function closeLightbox() {
     state.currentLightboxSrc = null;
   }, 300);
 }
-function downloadCurrentLightboxImage() {
-  const a = document.createElement("a");
-  a.href = state.currentLightboxSrc;
-  a.target = "_blank";
-  a.download = `img_${Date.now()}.png`;
-  a.click();
+async function downloadCurrentLightboxImage() {
+  const src = state.currentLightboxSrc;
+  if (!src) return;
+  try {
+    if (src.startsWith("data:")) {
+      const a = document.createElement("a");
+      a.href = src;
+      a.download = `img_${Date.now()}.png`;
+      a.click();
+      return;
+    }
+
+    const res = await fetch(src, { credentials: "same-origin" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `img_${Date.now()}.png`;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  } catch (e) {
+    console.warn("download failed, fallback to open:", e);
+    window.open(src, "_blank");
+  }
 }
 
 document.addEventListener("keydown", (e) => {
